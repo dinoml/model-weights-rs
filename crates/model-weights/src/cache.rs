@@ -39,6 +39,7 @@ const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_MAXIMUM_SCAN_ENTRIES: usize = 1_000_000;
 const MAXIMUM_CACHE_SCAN_DEPTH: usize = 16;
+#[cfg(windows)]
 const LEASE_RELEASE_RETRIES: usize = 100;
 #[cfg(windows)]
 const LEASE_RELEASE_RETRY_INTERVAL: Duration = Duration::from_millis(1);
@@ -1452,21 +1453,19 @@ fn replacement_paths(entry_path: &Path, scan: &mut ScanBudget<'_>) -> Result<Vec
     Ok(paths.into_iter().map(|(_, path)| path).collect())
 }
 
+#[cfg(windows)]
 fn replacement_lookup_raced(error: &Error, path: &Path) -> bool {
     if !path.exists() {
         return true;
     }
-    #[cfg(windows)]
-    {
-        StdError::source(error)
-            .and_then(|source| source.downcast_ref::<io::Error>())
-            .is_some_and(windows_filesystem_operation_is_transient)
-    }
-    #[cfg(not(windows))]
-    {
-        let _error = error;
-        false
-    }
+    StdError::source(error)
+        .and_then(|source| source.downcast_ref::<io::Error>())
+        .is_some_and(windows_filesystem_operation_is_transient)
+}
+
+#[cfg(not(windows))]
+fn replacement_lookup_raced(_error: &Error, path: &Path) -> bool {
+    !path.exists()
 }
 
 fn update_hash_part(hasher: &mut Sha256, bytes: &[u8]) {
@@ -2063,6 +2062,25 @@ fn lease_is_contended(error: &io::Error) -> bool {
     false
 }
 
+#[cfg(not(windows))]
+fn release_writer_lease(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let claimed = parent.join(format!("{name}.reap-{}", unique_token()));
+    match fs::rename(path, &claimed) {
+        Ok(()) => {
+            let _cleanup = fs::remove_dir_all(claimed);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+}
+
+#[cfg(windows)]
 fn release_writer_lease(path: &Path) {
     let Some(parent) = path.parent() else {
         return;
@@ -2071,8 +2089,6 @@ fn release_writer_lease(path: &Path) {
         return;
     };
     for attempt in 0..LEASE_RELEASE_RETRIES {
-        #[cfg(not(windows))]
-        let _attempt = attempt;
         let claimed = parent.join(format!("{name}.reap-{}", unique_token()));
         match fs::rename(path, &claimed) {
             Ok(()) => {
@@ -2080,7 +2096,6 @@ fn release_writer_lease(path: &Path) {
                 return;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            #[cfg(windows)]
             Err(error) if windows_filesystem_operation_is_transient(&error) => {
                 if attempt + 1 < LEASE_RELEASE_RETRIES {
                     thread::sleep(LEASE_RELEASE_RETRY_INTERVAL);
