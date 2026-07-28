@@ -1,0 +1,34 @@
+[package]
+name = "model-weights"
+description = "Safe model-weight inventory, deterministic preparation, caching, and bounded delivery"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "../../README.md"
+keywords = ["machine-learning", "safetensors", "checkpoint", "weights"]
+categories = ["science", "filesystem"]
+
+[features]
+default = ["mmap"]
+mmap = ["dep:memmap2"]
+test-util = []
+
+[dependencies]
+crossbeam-channel.workspace = true
+half.workspace = true
+memmap2 = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

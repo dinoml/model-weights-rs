@@ -1,0 +1,50 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "dinoml-sd15-loader-benchmark"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[features]
+default = []
+full-native = ["dep:dinoml-stable-diffusion"]
+
+[[bin]]
+name = "full_native"
+path = "src/bin/full_native.rs"
+required-features = ["full-native"]
+
+[dependencies]
+dinoml-autoencoder-kl = { path = "../../../dinoml_v2/crates/dinoml-autoencoder-kl" }
+dinoml-checkpoint = { path = "../../../dinoml_v2/crates/dinoml-checkpoint" }
+dinoml-clip = { path = "../../../dinoml_v2/crates/dinoml-clip" }
+dinoml-runtime = { path = "../../../dinoml_v2/crates/dinoml-runtime" }
+dinoml-stable-diffusion = { path = "../../../dinoml_v2/crates/dinoml-stable-diffusion", optional = true }
+dinoml-unet2d-condition = { path = "../../../dinoml_v2/crates/dinoml-unet2d-condition" }
+model-weights = { path = "../../crates/model-weights" }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+
+[dev-dependencies]
+tempfile = "3.20.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.0", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+debug = 1
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
