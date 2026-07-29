@@ -11,7 +11,6 @@
 //! Deserialization replays all inference and validation instead of trusting
 //! serialized derived state.
 
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
@@ -35,10 +34,10 @@ const ALLOCATION_TILE_BYTES: usize = 1024 * 1024;
 ///
 /// `logical_strides` describes the consumer-visible logical view.
 /// `storage_strides` maps those same logical axes into physical storage. The
-/// logical and storage shapes must contain the same number of elements, and
-/// both stride sets must describe dense, non-overlapping mappings. This
-/// permits logical OIHW strides to remain contiguous while physical storage is
-/// OHWI.
+/// logical strides must describe a dense view. Storage strides must describe
+/// an injective mapping of that view into the physical allocation, which may
+/// contain unreachable padding. This permits logical OIHW strides to remain
+/// contiguous while physical storage is OHWI or channel-padded KYXC.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "TensorFactsWire")]
 pub struct TensorFacts {
@@ -90,18 +89,12 @@ impl TensorFacts {
 
         let logical_elements = checked_element_count(&logical_shape)?;
         let storage_elements = checked_element_count(&storage_shape)?;
-        if logical_elements != storage_elements {
-            return Err(Error::invalid(
-                "logical and storage shapes must contain the same element count",
-            ));
-        }
         validate_dense_strides(&logical_shape, &logical_strides, logical_elements)?;
-        validate_dense_strides(&logical_shape, &storage_strides, logical_elements)?;
-        validate_storage_shape(
+        validate_storage_strides(
             &logical_shape,
-            &storage_shape,
             &storage_strides,
             logical_elements,
+            storage_elements,
         )?;
         if representation.layout().is_contiguous() {
             let expected_storage_strides = contiguous_strides(&logical_shape)?;
@@ -411,6 +404,65 @@ impl Permute {
     }
 }
 
+/// Copies logical values into permuted, zero-padded physical storage.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Pad {
+    order: Box<[u32]>,
+    storage_shape: Box<[u64]>,
+    target_layout: Layout,
+}
+
+impl Pad {
+    /// Creates a high-end zero-padding storage operation.
+    ///
+    /// `order` lists source logical axes in physical storage order.
+    /// `storage_shape` declares the resulting physical dimensions in that
+    /// same order. Every physical dimension must be at least as large as its
+    /// mapped logical dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-format error unless `order` is a complete
+    /// permutation with the same rank as `storage_shape`.
+    pub fn storage_zero(
+        order: impl Into<Box<[u32]>>,
+        storage_shape: impl Into<Box<[u64]>>,
+        target_layout: Layout,
+    ) -> Result<Self> {
+        let order = order.into();
+        let storage_shape = storage_shape.into();
+        validate_permutation(&order)?;
+        if order.len() != storage_shape.len() {
+            return Err(Error::invalid(
+                "padding order and physical storage shape must have equal ranks",
+            ));
+        }
+        Ok(Self {
+            order,
+            storage_shape,
+            target_layout,
+        })
+    }
+
+    /// Returns physical output axes in source logical-axis order.
+    #[must_use]
+    pub const fn order(&self) -> &[u32] {
+        &self.order
+    }
+
+    /// Returns the zero-padded physical storage dimensions.
+    #[must_use]
+    pub const fn storage_shape(&self) -> &[u64] {
+        &self.storage_shape
+    }
+
+    /// Returns the resulting physical layout descriptor.
+    #[must_use]
+    pub const fn target_layout(&self) -> &Layout {
+        &self.target_layout
+    }
+}
+
 /// Slices every logical axis into one materialized output.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Slice {
@@ -516,6 +568,8 @@ pub enum Operation {
     Concat(Concat),
     /// Logical or physical axis permutation.
     Permute(Permute),
+    /// Zero-padded physical storage permutation.
+    Pad(Pad),
     /// Per-axis materialized slicing.
     Slice(Slice),
     /// Ordered multi-output axis splitting.
@@ -544,6 +598,7 @@ impl Operation {
         let operation = match self {
             Self::Concat(_) => "concat",
             Self::Permute(_) => "permute",
+            Self::Pad(_) => "pad",
             Self::Slice(_) => "slice",
             Self::Split(_) => "split",
             Self::Reshape(_) => "reshape",
@@ -958,6 +1013,7 @@ impl OperationGraph {
             }
             Operation::Concat(_)
             | Operation::Permute(_)
+            | Operation::Pad(_)
             | Operation::Slice(_)
             | Operation::Split(_)
             | Operation::Prepare(_) => None,
@@ -1011,6 +1067,7 @@ impl OperationGraph {
                 Operation::Prepare(transform) => transform.scratch_bytes(),
                 Operation::Concat(_)
                 | Operation::Permute(_)
+                | Operation::Pad(_)
                 | Operation::Slice(_)
                 | Operation::Split(_)
                 | Operation::Reshape(_) => 0,
@@ -1539,6 +1596,7 @@ fn operation_kind(operation: &Operation, materialized_output_bytes: u64) -> Oper
     match operation {
         Operation::Concat(_) => OperationKind::Concat,
         Operation::Permute(_) => OperationKind::Permute,
+        Operation::Pad(_) => OperationKind::Pad,
         Operation::Slice(_) => OperationKind::Slice,
         Operation::Split(_) => OperationKind::Split,
         Operation::Reshape(_) => OperationKind::Reshape,
@@ -1566,6 +1624,7 @@ fn execute_node(
         Operation::Permute(permute) => {
             execute_permute_node(permute, node, inputs, input_facts, cancellation)
         }
+        Operation::Pad(pad) => execute_pad_node(pad, node, inputs, input_facts, cancellation),
         Operation::Slice(slice) => {
             execute_slice_node(slice, node, inputs, input_facts, cancellation)
         }
@@ -1645,6 +1704,26 @@ fn execute_permute_node(
     let mut output = allocate_tensor(output_facts, cancellation)?;
     execute_permute_bytes(
         permute,
+        input_facts,
+        output_facts,
+        &input.bytes,
+        &mut output,
+        cancellation,
+    )?;
+    Ok(fresh_node_execution(output))
+}
+
+fn execute_pad_node(
+    _pad: &Pad,
+    node: &OperationNode,
+    inputs: &[RuntimeValue],
+    input_facts: &[&TensorFacts],
+    cancellation: &CancellationToken,
+) -> Result<NodeExecution> {
+    let (input, input_facts, output_facts) = unary_execution_parts(node, inputs, input_facts)?;
+    validate_view_len(&input.bytes, input_facts.byte_len(), "padding input")?;
+    let mut output = allocate_tensor(output_facts, cancellation)?;
+    execute_storage_copy(
         input_facts,
         output_facts,
         &input.bytes,
@@ -2007,6 +2086,9 @@ fn execute_permute_bytes(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     validate_view_len(input, input_facts.byte_len(), "permutation input")?;
+    if matches!(permute.mode(), PermuteMode::Storage { .. }) {
+        return execute_storage_copy(input_facts, output_facts, input, output, cancellation);
+    }
     let width = dtype_width(input_facts.representation().dtype())?;
     let output_row_strides = contiguous_strides(output_facts.logical_shape())?;
     let order = permutation_indices(permute.order())?;
@@ -2015,47 +2097,71 @@ fn execute_permute_bytes(
         check_copy_cancellation(linear, cancellation)?;
         let mut source_element = 0_u64;
         let mut target_element = 0_u64;
-        match permute.mode() {
-            PermuteMode::Logical => {
-                for (output_axis, &input_axis) in order.iter().enumerate() {
-                    let coordinate = logical_coordinate(
-                        linear,
-                        output_axis,
-                        output_facts.logical_shape(),
-                        &output_row_strides,
-                    )?;
-                    source_element = checked_offset_term(
-                        source_element,
-                        coordinate,
-                        input_facts.storage_strides()[input_axis],
-                    )?;
-                    target_element = checked_offset_term(
-                        target_element,
-                        coordinate,
-                        output_facts.storage_strides()[output_axis],
-                    )?;
-                }
-            }
-            PermuteMode::Storage { .. } => {
-                for logical_axis in 0..output_facts.logical_shape().len() {
-                    let coordinate = logical_coordinate(
-                        linear,
-                        logical_axis,
-                        output_facts.logical_shape(),
-                        &output_row_strides,
-                    )?;
-                    source_element = checked_offset_term(
-                        source_element,
-                        coordinate,
-                        input_facts.storage_strides()[logical_axis],
-                    )?;
-                    target_element = checked_offset_term(
-                        target_element,
-                        coordinate,
-                        output_facts.storage_strides()[logical_axis],
-                    )?;
-                }
-            }
+        for (output_axis, &input_axis) in order.iter().enumerate() {
+            let coordinate = logical_coordinate(
+                linear,
+                output_axis,
+                output_facts.logical_shape(),
+                &output_row_strides,
+            )?;
+            source_element = checked_offset_term(
+                source_element,
+                coordinate,
+                input_facts.storage_strides()[input_axis],
+            )?;
+            target_element = checked_offset_term(
+                target_element,
+                coordinate,
+                output_facts.storage_strides()[output_axis],
+            )?;
+        }
+        copy_element(
+            input.as_slice(),
+            source_element,
+            output,
+            target_element,
+            width,
+        )?;
+    }
+    cancellation.check()
+}
+
+fn execute_storage_copy(
+    input_facts: &TensorFacts,
+    output_facts: &TensorFacts,
+    input: &ByteView,
+    output: &mut [u8],
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    validate_view_len(input, input_facts.byte_len(), "storage-copy input")?;
+    if input_facts.logical_shape() != output_facts.logical_shape() {
+        return Err(Error::integrity(
+            "storage-copy input and output logical shapes differ",
+        ));
+    }
+    let width = dtype_width(input_facts.representation().dtype())?;
+    let logical_row_strides = contiguous_strides(output_facts.logical_shape())?;
+    for linear in 0..output_facts.element_count() {
+        check_copy_cancellation(linear, cancellation)?;
+        let mut source_element = 0_u64;
+        let mut target_element = 0_u64;
+        for logical_axis in 0..output_facts.logical_shape().len() {
+            let coordinate = logical_coordinate(
+                linear,
+                logical_axis,
+                output_facts.logical_shape(),
+                &logical_row_strides,
+            )?;
+            source_element = checked_offset_term(
+                source_element,
+                coordinate,
+                input_facts.storage_strides()[logical_axis],
+            )?;
+            target_element = checked_offset_term(
+                target_element,
+                coordinate,
+                output_facts.storage_strides()[logical_axis],
+            )?;
         }
         copy_element(
             input.as_slice(),
@@ -2446,11 +2552,62 @@ fn infer_outputs(operation: &Operation, inputs: &[&TensorFacts]) -> Result<Box<[
     match operation {
         Operation::Concat(concat) => infer_concat(*concat, inputs),
         Operation::Permute(permute) => infer_permute(permute, one_input(inputs)?),
+        Operation::Pad(pad) => infer_pad(pad, one_input(inputs)?),
         Operation::Slice(slice) => infer_slice(slice, one_input(inputs)?),
         Operation::Split(split) => infer_split(split, one_input(inputs)?),
         Operation::Reshape(reshape) => infer_reshape(reshape, one_input(inputs)?),
         Operation::Prepare(transform) => infer_prepare(transform, one_input(inputs)?),
     }
+}
+
+fn infer_pad(pad: &Pad, input: &TensorFacts) -> Result<Box<[TensorFacts]>> {
+    validate_permutation(pad.order())?;
+    let rank = input.logical_shape().len();
+    if pad.order().len() != rank || pad.storage_shape().len() != rank {
+        return Err(Error::binding(
+            "padding rank must equal the input logical rank",
+        ));
+    }
+    if pad.target_layout().is_contiguous() {
+        return Err(Error::binding(
+            "zero-padded physical storage requires a non-contiguous target layout",
+        ));
+    }
+    let order = permutation_indices(pad.order())?;
+    let mut has_padding = false;
+    for (physical_axis, &logical_axis) in order.iter().enumerate() {
+        let logical = input.logical_shape()[logical_axis];
+        let physical = pad.storage_shape()[physical_axis];
+        if physical < logical {
+            return Err(Error::binding(
+                "padded physical dimension is smaller than its logical dimension",
+            ));
+        }
+        has_padding |= physical > logical;
+    }
+    if !has_padding {
+        return Err(Error::binding(
+            "padding operation must enlarge at least one physical dimension",
+        ));
+    }
+
+    let physical_strides = contiguous_strides(pad.storage_shape())?;
+    let mut storage_strides = vec![0_u64; rank];
+    for (physical_axis, &logical_axis) in order.iter().enumerate() {
+        storage_strides[logical_axis] = physical_strides[physical_axis];
+    }
+    let dtype = input.representation().dtype();
+    let representation = Representation::new(dtype, pad.target_layout().clone());
+    let byte_len = dtype.byte_len(pad.storage_shape())?;
+    Ok(vec![TensorFacts::new(
+        input.logical_shape().to_vec(),
+        pad.storage_shape().to_vec(),
+        input.logical_strides().to_vec(),
+        storage_strides,
+        representation,
+        byte_len,
+    )?]
+    .into_boxed_slice())
 }
 
 fn one_input<'a>(inputs: &'a [&TensorFacts]) -> Result<&'a TensorFacts> {
@@ -2726,43 +2883,43 @@ fn validate_dense_strides(shape: &[u64], strides: &[u64], elements: u64) -> Resu
     Ok(())
 }
 
-fn validate_storage_shape(
+fn validate_storage_strides(
     logical_shape: &[u64],
-    storage_shape: &[u64],
     storage_strides: &[u64],
-    elements: u64,
+    logical_elements: u64,
+    storage_elements: u64,
 ) -> Result<()> {
-    let mut logical_dimensions = logical_shape.to_vec();
-    let mut storage_dimensions = storage_shape.to_vec();
-    logical_dimensions.sort_unstable();
-    storage_dimensions.sort_unstable();
-    if logical_dimensions != storage_dimensions {
-        return Err(Error::invalid(
-            "storage shape must be an axis permutation of the logical shape",
-        ));
-    }
-    if elements == 0 {
+    if logical_elements == 0 {
         return Ok(());
     }
-
-    let mut logical_axes = logical_shape
+    if storage_elements == 0 {
+        return Err(Error::invalid(
+            "non-empty logical tensor requires non-empty physical storage",
+        ));
+    }
+    let mut axes = logical_shape
         .iter()
         .copied()
         .zip(storage_strides.iter().copied())
         .filter(|(dimension, _)| *dimension > 1)
         .collect::<Vec<_>>();
-    logical_axes.sort_unstable_by_key(|axis| Reverse(axis.1));
-    let physical_dimensions = storage_shape
-        .iter()
-        .copied()
-        .filter(|dimension| *dimension > 1);
-    if !logical_axes
-        .into_iter()
-        .map(|(dimension, _)| dimension)
-        .eq(physical_dimensions)
-    {
+    axes.sort_unstable_by_key(|(_, stride)| *stride);
+    let mut span = 1_u64;
+    for (dimension, stride) in axes {
+        if stride < span {
+            return Err(Error::invalid(
+                "physical element strides overlap logical coordinates",
+            ));
+        }
+        span = dimension
+            .checked_sub(1)
+            .and_then(|extent| extent.checked_mul(stride))
+            .and_then(|extent| extent.checked_add(span))
+            .ok_or_else(|| Error::limit("physical element-stride span overflows u64"))?;
+    }
+    if span > storage_elements {
         return Err(Error::invalid(
-            "storage shape axis order disagrees with physical storage strides",
+            "physical element strides address beyond the storage allocation",
         ));
     }
     Ok(())
@@ -2942,12 +3099,12 @@ mod tests {
     }
 
     #[test]
-    fn tensor_facts_reject_storage_shape_order_that_disagrees_with_strides() {
+    fn tensor_facts_reject_storage_strides_that_address_beyond_allocation() {
         let error = TensorFacts::new(
             [2, 3],
-            [3, 2],
+            [2, 4],
             [3, 1],
-            [3, 1],
+            [8, 2],
             Representation::new(
                 DType::U8,
                 Layout::custom(
@@ -2956,9 +3113,9 @@ mod tests {
                     Vec::<u8>::new(),
                 ),
             ),
-            6,
+            8,
         )
-        .expect_err("physical shape order must agree with storage strides");
+        .expect_err("physical strides must remain within the allocation");
 
         assert_eq!(error.category(), ErrorCategory::InvalidFormat);
     }
@@ -3020,6 +3177,58 @@ mod tests {
                 &[12, 1, 6, 3][..],
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn storage_padding_preserves_logical_oihw_and_infers_padded_kyxc() -> Result<()> {
+        let mut builder = OperationGraph::builder();
+        let input = builder.add_input(name("weight")?, contiguous(&[1, 2, 2, 2], DType::F16)?)?;
+        let outputs = add_operation(
+            &mut builder,
+            Operation::Pad(Pad::storage_zero(
+                [0, 2, 3, 1],
+                [1, 2, 2, 4],
+                custom_layout("test/padded-kyxc")?,
+            )?),
+            vec![input],
+        )?;
+        let graph = builder.build(outputs[0])?;
+
+        assert_eq!(
+            (
+                graph.output_facts().logical_shape(),
+                graph.output_facts().storage_shape(),
+                graph.output_facts().logical_strides(),
+                graph.output_facts().storage_strides(),
+                graph.output_facts().byte_len(),
+            ),
+            (
+                &[1, 2, 2, 2][..],
+                &[1, 2, 2, 4][..],
+                &[8, 4, 2, 1][..],
+                &[16, 1, 8, 4][..],
+                32,
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn storage_padding_rejects_undersized_physical_dimension() -> Result<()> {
+        let mut builder = OperationGraph::builder();
+        let input = builder.add_input(name("weight")?, contiguous(&[1, 3, 2, 2], DType::F16)?)?;
+        let operation = Operation::Pad(Pad::storage_zero(
+            [0, 2, 3, 1],
+            [1, 2, 2, 2],
+            custom_layout("test/padded-kyxc")?,
+        )?);
+        let implementation = operation.builtin_implementation()?;
+        let error = builder
+            .add_operation(implementation, operation, vec![input])
+            .expect_err("physical padding cannot truncate a logical dimension");
+
+        assert_eq!(error.category(), ErrorCategory::Binding);
         Ok(())
     }
 
@@ -3298,6 +3507,31 @@ mod tests {
         let execution = graph.execute_host(&[input], &engine, &CancellationToken::new())?;
 
         assert_eq!(execution.output().as_slice(), [0, 4, 1, 5, 2, 6, 3, 7]);
+        Ok(())
+    }
+
+    #[test]
+    fn host_storage_padding_writes_kyxc_values_and_zero_fills_tail_channels() -> Result<()> {
+        let mut builder = OperationGraph::builder();
+        let input = builder.add_input(name("weight")?, contiguous(&[1, 2, 2, 2], DType::U8)?)?;
+        let outputs = add_operation(
+            &mut builder,
+            Operation::Pad(Pad::storage_zero(
+                [0, 2, 3, 1],
+                [1, 2, 2, 4],
+                custom_layout("test/padded-kyxc")?,
+            )?),
+            vec![input],
+        )?;
+        let graph = builder.build(outputs[0])?;
+        let input = ByteView::from_boxed(vec![0, 1, 2, 3, 4, 5, 6, 7].into_boxed_slice());
+        let engine = PreparationEngine::with_builtins()?;
+        let execution = graph.execute_host(&[input], &engine, &CancellationToken::new())?;
+
+        assert_eq!(
+            execution.output().as_slice(),
+            [0, 4, 0, 0, 1, 5, 0, 0, 2, 6, 0, 0, 3, 7, 0, 0]
+        );
         Ok(())
     }
 

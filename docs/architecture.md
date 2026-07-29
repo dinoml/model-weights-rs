@@ -43,17 +43,18 @@ versioned implementation identities.
 - storage strides map logical coordinates to physical elements; and
 - representation records scalar dtype and physical layout.
 
-The two shapes contain the same number of elements, while both stride maps must
-be dense, non-overlapping, and rank-compatible. This distinction lets a logical
-OIHW constant keep its model-facing shape and strides when a storage
-permutation writes OHWI/KYXC bytes. Rank, shape, strides, dtype, layout, exact
-byte length, and arithmetic overflow are checked while the graph is built and
-again when it is deserialized. The final inferred facts must exactly match the
-target contract.
+The physical shape may contain additional padding elements. Logical strides
+must remain dense, while physical strides must map logical coordinates
+injectively within the allocation. This distinction lets a logical OIHW
+constant keep its model-facing shape and strides when a storage permutation
+writes OHWI/KYXC bytes with optional channel padding. Rank, shape, strides,
+dtype, layout, exact byte length, and arithmetic overflow are checked while the
+graph is built and again when it is deserialized. The final inferred facts must
+exactly match the target contract.
 
 The structural operation set is intentionally small: N-input concat, logical
-and physical permutation, materialized slice, ordered multi-output split, and
-metadata-only contiguous reshape. `Prepare` embeds one existing versioned
+and physical permutation, zero-padded physical storage, materialized slice,
+ordered multi-output split, and metadata-only contiguous reshape. `Prepare` embeds one existing versioned
 provider transform, such as a dtype cast. A graph selects one final value for
 one target binding.
 

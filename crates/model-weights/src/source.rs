@@ -61,6 +61,12 @@ pub enum DigestPolicy {
     ComputeOnDemand,
     /// Hash on demand and compare with the expected SHA-256.
     VerifyOnDemand(ContentDigest),
+    /// Reuse a digest that an upstream source already verified.
+    ///
+    /// This policy does not make an ordinary local source eligible for mapped
+    /// access. The caller remains responsible for preventing concurrent
+    /// mutation under the ordinary-local-file contract.
+    TrustExternal(ContentDigest),
     /// Reuse an externally verified digest while retaining immutable ownership.
     TrustRetained(ContentDigest),
 }
@@ -147,6 +153,31 @@ impl SourceDescriptor {
         let mut descriptor = Self::local(path)?;
         descriptor.expected_size = Some(expected_size);
         descriptor.digest_policy = DigestPolicy::VerifyOnDemand(digest);
+        Ok(descriptor)
+    }
+
+    /// Describes a local file whose digest was already verified upstream.
+    ///
+    /// Unlike [`Self::retained`], this constructor does not assert that mapped
+    /// access is safe. The source remains an ordinary local file and is always
+    /// copied when [`crate::AccessMode::Auto`] is used.
+    ///
+    /// The caller must ensure that `digest` and `expected_size` describe the
+    /// selected file and must prevent concurrent mutation while the checkpoint
+    /// is in use. An incorrect trusted digest can corrupt content-addressed
+    /// identities and cache entries, but cannot enable file-backed mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-path error when `path` has no portable file name.
+    pub fn local_with_trusted_digest(
+        path: impl AsRef<Path>,
+        expected_size: u64,
+        digest: ContentDigest,
+    ) -> Result<Self> {
+        let mut descriptor = Self::local(path)?;
+        descriptor.expected_size = Some(expected_size);
+        descriptor.digest_policy = DigestPolicy::TrustExternal(digest);
         Ok(descriptor)
     }
 

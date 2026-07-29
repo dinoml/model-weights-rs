@@ -31,18 +31,22 @@ copying tensor payloads during inventory. Ordinary files use positional reads
 and are hashed only when a content identity is needed. Retained immutable
 snapshots can reuse a previously verified digest and provide zero-copy mapped
 views. Authorizing that mapping is an explicit audited `unsafe` boundary,
-normally contained in the snapshot-store adapter.
+normally contained in the snapshot-store adapter. An upstream-verified digest
+can also be reused for a conservative copied source without asserting mmap
+safety.
 
 Binding-plan schema v2 can bind an ordered set of named source tensors to one
 target. A small, versioned operation graph covers N-input concatenation,
-logical or physical axis permutation, slicing, ordered splitting, metadata-only
-reshape, and provider-backed preparation such as dtype conversion. Graph
+logical or physical axis permutation, zero-padded physical storage, slicing,
+ordered splitting, metadata-only reshape, and provider-backed preparation such
+as dtype conversion. Graph
 construction infers and validates every intermediate before allocation.
 
 Tensor contracts distinguish the consumer-visible logical shape and strides
 from physical storage shape and strides. This allows a target to retain logical
-OIHW semantics while storing bytes as OHWI/KYXC, without presenting the
-physical byte order as a different logical tensor.
+OIHW semantics while storing bytes as OHWI/KYXC, including channel-padded
+storage, without presenting the physical byte order as a different logical
+tensor.
 
 The bounded core host executor can materialize a graph, or the materializer can
 delegate the same validated graph and exact ordered input views to a consumer
@@ -72,7 +76,8 @@ boundary and identity model and
 execution, and cache-identity decision. The
 [ecosystem integration guide](docs/integrations.md) documents the concrete
 `hf-store-rs`, `model-configs-rs`, DinoML, GGUF/provider, and Diffusers/Python
-adapter seams. The
+adapter seams. The [DinoML integration handoff](docs/dinoml-integration-handoff.md)
+turns the checked SD1.5 adapter into a staged runtime migration. The
 [benchmark protocol](docs/benchmarking.md) defines the Stable Diffusion 1.5
 regression comparison.
 

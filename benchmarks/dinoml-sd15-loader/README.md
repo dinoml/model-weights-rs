@@ -77,7 +77,8 @@ available.
 
 For process-cold collection, pass externally verified checkpoint identities with
 `--clip-sha256`, `--unet-sha256`, and `--vae-sha256`. These values are trusted:
-they must describe the exact files protected by the retained DinoML mappings.
+they must describe the exact files protected by the benchmark's retained source
+handles.
 The report records `identity_source` and `identity_bytes_hashed` per component.
 When an override is omitted, setup computes SHA-256 from the retained snapshot
 and reports the scanned bytes; that scan warms the filesystem cache and therefore

@@ -13,7 +13,8 @@ use tempfile::TempDir;
 
 use super::{AccessMode, Checkpoint, CheckpointBuilder, TensorData};
 use crate::identity::ContentDigest;
-use crate::source::SourceDescriptor;
+use crate::inventory::DigestState;
+use crate::source::{DigestPolicy, SourceDescriptor, SourceKind};
 use crate::{CancellationToken, ErrorCategory, Result};
 
 fn write_safetensors(
@@ -279,6 +280,50 @@ fn explicit_mapping_rejects_an_unretained_local_file() -> Result<()> {
         &[7],
     )?;
     let source = SourceDescriptor::local(path)?;
+    assert_eq!(
+        CheckpointBuilder::new(source)
+            .access_mode(AccessMode::Mmap)
+            .open()
+            .err()
+            .map(|error| error.category()),
+        Some(ErrorCategory::Unsupported)
+    );
+    Ok(())
+}
+
+#[test]
+fn trusted_local_digest_skips_rehash_without_enabling_mapping() -> Result<()> {
+    let directory = TempDir::new()
+        .map_err(|source| crate::Error::io("test could not create directory", source))?;
+    let path = write_safetensors(
+        &directory,
+        "trusted.safetensors",
+        r#"{"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#,
+        &[13],
+    )?;
+    let size = std::fs::metadata(&path)
+        .map_err(|source| crate::Error::io("test could not inspect checkpoint", source))?
+        .len();
+    let upstream_digest = ContentDigest::hash("upstream-test-digest-v1", [b"trusted"]);
+    let source = SourceDescriptor::local_with_trusted_digest(&path, size, upstream_digest)?;
+
+    assert_eq!(
+        source.digest_policy(),
+        DigestPolicy::TrustExternal(upstream_digest)
+    );
+    assert_eq!(source.kind(), SourceKind::Local);
+    let checkpoint = Checkpoint::open_source(source.clone())?;
+    assert_eq!(
+        checkpoint.inventory().files()[0].digest_state(),
+        DigestState::Trusted(upstream_digest)
+    );
+    assert_eq!(
+        checkpoint
+            .source_digests(&CancellationToken::new())?
+            .as_ref(),
+        &[upstream_digest]
+    );
+    assert_eq!(checkpoint.tensor("x")?.bytes().as_slice(), &[13]);
     assert_eq!(
         CheckpointBuilder::new(source)
             .access_mode(AccessMode::Mmap)

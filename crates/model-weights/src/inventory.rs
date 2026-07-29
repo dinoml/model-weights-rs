@@ -31,7 +31,9 @@ impl From<DigestPolicy> for DigestState {
         match policy {
             DigestPolicy::ComputeOnDemand => Self::Deferred,
             DigestPolicy::VerifyOnDemand(digest) => Self::Expected(digest),
-            DigestPolicy::TrustRetained(digest) => Self::Trusted(digest),
+            DigestPolicy::TrustExternal(digest) | DigestPolicy::TrustRetained(digest) => {
+                Self::Trusted(digest)
+            }
         }
     }
 }

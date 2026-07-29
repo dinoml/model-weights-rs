@@ -896,7 +896,10 @@ impl OpenFile {
     }
 
     fn needs_hashing(&self, cancellation: &CancellationToken) -> Result<bool> {
-        if matches!(self.source.digest_policy(), DigestPolicy::TrustRetained(_)) {
+        if matches!(
+            self.source.digest_policy(),
+            DigestPolicy::TrustExternal(_) | DigestPolicy::TrustRetained(_)
+        ) {
             return Ok(false);
         }
         loop {
@@ -929,7 +932,9 @@ impl OpenFile {
         if let Some(digest) = *cached {
             return Ok(digest);
         }
-        if let DigestPolicy::TrustRetained(digest) = self.source.digest_policy() {
+        if let DigestPolicy::TrustExternal(digest) | DigestPolicy::TrustRetained(digest) =
+            self.source.digest_policy()
+        {
             *cached = Some(digest);
             return Ok(digest);
         }
