@@ -46,6 +46,8 @@ Operation-graph schema v1 supports:
 - complete logical-axis permutation into contiguous storage;
 - physical-storage permutation that retains logical axes, including
   OIHW-to-OHWI/KYXC order `[0, 2, 3, 1]`;
+- high-end zero padding while permuting logical axes into larger physical
+  storage;
 - materialized slicing with one half-open range per logical axis;
 - ordered, non-overlapping split ranges with ordered outputs;
 - metadata-only reshape of compatible contiguous storage; and
@@ -60,7 +62,7 @@ implementation version.
 `OperationExecution::Host` is the default. It runs structural operations in the
 bounded host interpreter and routes `Prepare` nodes through the existing
 preparation engine. Reshape aliases compatible storage; concat, permutation,
-slice, and split materialize output. Execution checks cancellation at bounded
+padding, slice, and split materialize output. Execution checks cancellation at bounded
 intervals, including while zero-initializing large output allocations.
 
 Before execution, the graph computes a checked liveness bound for simultaneously

@@ -592,7 +592,7 @@ fn contract_digest(components: &[ComponentContract]) -> AppResult<String> {
 #[cfg(windows)]
 #[expect(
     unsafe_code,
-    reason = "DinoML's retained mapping denies writes and deletes for the descriptor lifetime"
+    reason = "the independently retained Windows handle denies writes and deletes"
 )]
 fn retained_source<T>(
     logical_path: &str,
@@ -604,16 +604,48 @@ fn retained_source<T>(
 where
     T: Send + Sync + 'static,
 {
-    // SAFETY: each DinoML checkpoint owns a read-only `MappedSafetensors`.
-    // Its Windows handle permits only FILE_SHARE_READ, so retaining the
-    // checkpoint as `guard` prevents mutation, replacement, deletion, and
-    // truncation until every descriptor-derived mapping has been dropped.
-    unsafe { SourceDescriptor::retained(logical_path, local_path, size, digest, guard) }
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let locked_file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(local_path)
+        .map_err(|source| {
+            model_weights::Error::from_category_with_source(
+                model_weights::ErrorCategory::Io,
+                "failed to retain benchmark checkpoint source",
+                source,
+            )
+        })?;
+    let metadata = locked_file.metadata().map_err(|source| {
+        model_weights::Error::from_category_with_source(
+            model_weights::ErrorCategory::Io,
+            "failed to inspect retained benchmark checkpoint source",
+            source,
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() != size {
+        return Err(model_weights::Error::from_category(
+            model_weights::ErrorCategory::Integrity,
+            "retained benchmark checkpoint source changed during discovery",
+        ));
+    }
+    drop(guard);
+
+    // SAFETY: DinoML's checkpoint handle denies writes and deletes while
+    // `locked_file` is acquired. The independently owned handle then preserves
+    // that denial without a lifetime dependency on DinoML's legacy loader.
+    // The discovered size and digest describe the same continuously locked
+    // file, and model-weights retains `locked_file` for every mapped view.
+    unsafe { SourceDescriptor::retained(logical_path, local_path, size, digest, locked_file) }
 }
 
 #[cfg(not(windows))]
 fn retained_source<T>(
-    _logical_path: &str,
+    logical_path: &str,
     local_path: &Path,
     size: u64,
     digest: ContentDigest,
@@ -623,7 +655,8 @@ where
     T: Send + Sync + 'static,
 {
     drop(guard);
-    SourceDescriptor::local_with_digest(local_path, size, digest)
+    SourceDescriptor::local_with_trusted_digest(local_path, size, digest)
+        .and_then(|source| source.with_logical_path(logical_path))
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {

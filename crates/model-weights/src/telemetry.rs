@@ -48,6 +48,8 @@ pub enum OperationKind {
     Concat,
     /// Tensor axes or physical storage were permuted.
     Permute,
+    /// Logical values were copied into larger zero-padded physical storage.
+    Pad,
     /// A materialized slice was selected.
     Slice,
     /// One tensor was split into ordered materialized outputs.
@@ -67,6 +69,7 @@ impl OperationKind {
             Self::Cast => "cast",
             Self::Concat => "concat",
             Self::Permute => "permute",
+            Self::Pad => "pad",
             Self::Slice => "slice",
             Self::Split => "split",
             Self::Reshape => "reshape",

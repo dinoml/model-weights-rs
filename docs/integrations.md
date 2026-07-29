@@ -94,9 +94,14 @@ fn retained_weight_sources(
 ```
 
 The safety comment is part of the adapter contract, not boilerplate. If another
-process can edit the cache root, or when using `CacheMode::Compatible`, use
-`SourceDescriptor::local_with_digest(...).with_logical_path(...)` and copied
-reads instead of asserting the retained-mapping invariant.
+process can edit the cache root, or when using `CacheMode::Compatible`, do not
+assert the retained-mapping invariant. When hf-store's digest validation is an
+accepted integrity boundary, use
+`SourceDescriptor::local_with_trusted_digest(...).with_logical_path(...)`; this
+reuses the verified digest but remains an ordinary copied source under
+`AccessMode::Auto`. Use `local_with_digest` instead when model-weights must
+independently verify the declared digest. Both local modes require the consumer
+to prevent concurrent mutation while the checkpoint is in use.
 
 Pass only the selected component and variant shards to
 `CheckpointBuilder::from_sources`. Prefer an available checkpoint variant whose
@@ -493,7 +498,8 @@ A reference-validation harness should:
 
 Binding-plan schema v2 removes the general single-source limitation for typed
 operation graphs. Built-in graphs cover ordered joins, transposes, physical
-layout permutations, slices, splits, reshapes, and provider preparation. The
+layout permutations, zero-padded storage, slices, splits, reshapes, and
+provider preparation. The
 external `ConversionRecipe` contract remains single-input and each binding
 still delivers one selected target. A recipe may name several outputs and be
 reused by target bindings that explicitly opt into one `shared_source_group`,
