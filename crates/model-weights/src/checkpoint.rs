@@ -687,7 +687,8 @@ impl Debug for OpenFile {
 
 impl OpenFile {
     fn open(source: SourceDescriptor, id: FileId) -> Result<Self> {
-        let file = File::open(source.local_path())
+        let file = source
+            .open_file()
             .map_err(|error| Error::io("failed to open checkpoint source", error))?;
         let metadata = file
             .metadata()
@@ -859,16 +860,22 @@ impl OpenFile {
             .lock()
             .map_err(|_error| Error::integrity("checkpoint mapping lock is poisoned"))?;
         if slot.is_none() {
-            // SAFETY: `self.file` remains open for the mapping lifetime, the
-            // retained snapshot guard prevents removal or mutation, and views
-            // hold the resulting owner independently of the checkpoint.
-            let mapping = unsafe { memmap2::MmapOptions::new().map(&self.file) }
+            let retention = self.source.retention().ok_or_else(|| {
+                Error::integrity("retained snapshot source has no lifetime guard")
+            })?;
+            let file = self
+                .file
+                .try_clone()
+                .map_err(|source| Error::io("failed to retain mapped checkpoint source", source))?;
+            // SAFETY: `file` is retained by the mapping owner, the snapshot
+            // guard prevents mutation, and views retain both independently of
+            // the checkpoint.
+            let mapping = unsafe { memmap2::MmapOptions::new().map(&file) }
                 .map_err(|source| Error::io("failed to map checkpoint source", source))?;
             *slot = Some(Arc::new(MappedOwner {
                 mapping,
-                _retention: self.source.retention().ok_or_else(|| {
-                    Error::integrity("retained snapshot source has no lifetime guard")
-                })?,
+                _file: file,
+                _retention: retention,
             }));
         }
         let owner = Arc::clone(
@@ -983,6 +990,7 @@ impl OpenFile {
 #[cfg(feature = "mmap")]
 struct MappedOwner {
     mapping: memmap2::Mmap,
+    _file: File,
     _retention: Arc<dyn std::any::Any + Send + Sync>,
 }
 

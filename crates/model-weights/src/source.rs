@@ -2,6 +2,8 @@
 
 use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
+use std::fs::File;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -104,6 +106,7 @@ impl Debug for Retention {
 pub struct SourceDescriptor {
     logical_path: RepoPath,
     local_path: PathBuf,
+    retained_file: Option<Arc<File>>,
     expected_size: Option<u64>,
     digest_policy: DigestPolicy,
     kind: SourceKind,
@@ -130,6 +133,7 @@ impl SourceDescriptor {
         Ok(Self {
             logical_path: RepoPath::parse(name)?,
             local_path,
+            retained_file: None,
             expected_size: None,
             digest_policy: DigestPolicy::ComputeOnDemand,
             kind: SourceKind::Local,
@@ -215,6 +219,70 @@ impl SourceDescriptor {
         Ok(Self {
             logical_path: RepoPath::parse(logical_path)?,
             local_path: local_path.as_ref().to_owned(),
+            retained_file: None,
+            expected_size: Some(size),
+            digest_policy: DigestPolicy::TrustRetained(digest),
+            kind: SourceKind::RetainedSnapshot,
+            retention: Some(Retention {
+                guard: Arc::new(guard),
+            }),
+        })
+    }
+
+    /// Describes an already-open retained immutable snapshot file.
+    ///
+    /// The source file is cloned from its existing operating-system handle
+    /// when the checkpoint opens. No filesystem path is recovered or reopened.
+    /// `guard` is held until every checkpoint, mapping, and zero-copy byte view
+    /// derived from this descriptor has been dropped.
+    ///
+    /// # Safety
+    ///
+    /// Until the guard and every clone derived from this descriptor are
+    /// dropped, the caller must guarantee that the supplied file's length and
+    /// contents cannot be modified or truncated by this process or another
+    /// process. `size` and `digest` must describe those exact immutable bytes.
+    /// Violating these requirements can make a file-backed mapping unsound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-path error when `logical_path` is unsafe, an I/O
+    /// error when the handle cannot be inspected, an invalid-format error when
+    /// it is not a regular file, or an integrity error when its size differs
+    /// from `size`.
+    #[expect(
+        unsafe_code,
+        reason = "the caller must uphold file-backed mapping invariants that the OS cannot prove"
+    )]
+    pub unsafe fn retained_file<T>(
+        logical_path: impl AsRef<str>,
+        file: File,
+        size: u64,
+        digest: ContentDigest,
+        guard: T,
+    ) -> Result<Self>
+    where
+        T: Send + Sync + 'static,
+    {
+        let logical_path = RepoPath::parse(logical_path)?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| Error::io("failed to inspect retained checkpoint handle", source))?;
+        if !metadata.is_file() {
+            return Err(Error::invalid(
+                "retained checkpoint handle is not a regular file",
+            ));
+        }
+        if metadata.len() != size {
+            return Err(Error::integrity(
+                "retained checkpoint handle size differs from its declared size",
+            ));
+        }
+        let local_path = PathBuf::from(logical_path.as_str());
+        Ok(Self {
+            logical_path,
+            local_path,
+            retained_file: Some(Arc::new(file)),
             expected_size: Some(size),
             digest_policy: DigestPolicy::TrustRetained(digest),
             kind: SourceKind::RetainedSnapshot,
@@ -231,6 +299,9 @@ impl SourceDescriptor {
     /// Returns an invalid-path error when `logical_path` is unsafe.
     pub fn with_logical_path(mut self, logical_path: impl AsRef<str>) -> Result<Self> {
         self.logical_path = RepoPath::parse(logical_path)?;
+        if self.retained_file.is_some() {
+            self.local_path = PathBuf::from(self.logical_path.as_str());
+        }
         Ok(self)
     }
 
@@ -240,7 +311,11 @@ impl SourceDescriptor {
         &self.logical_path
     }
 
-    /// Returns the local path opened by the checkpoint.
+    /// Returns the local path opened by a path-backed checkpoint.
+    ///
+    /// Handle-backed retained sources return their safe logical path because
+    /// they deliberately have no recoverable local path. The checkpoint opens
+    /// those sources from the retained handle rather than this value.
     #[must_use]
     pub fn local_path(&self) -> &Path {
         &self.local_path
@@ -264,6 +339,12 @@ impl SourceDescriptor {
         self.kind
     }
 
+    pub(crate) fn open_file(&self) -> io::Result<File> {
+        self.retained_file
+            .as_ref()
+            .map_or_else(|| File::open(&self.local_path), |file| file.try_clone())
+    }
+
     #[cfg(feature = "mmap")]
     pub(crate) fn retention(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         self.retention
@@ -274,10 +355,14 @@ impl SourceDescriptor {
 
 impl Debug for SourceDescriptor {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SourceDescriptor")
-            .field("logical_path", &self.logical_path)
-            .field("local_path", &self.local_path)
+        let mut debug = formatter.debug_struct("SourceDescriptor");
+        debug.field("logical_path", &self.logical_path);
+        if self.retained_file.is_some() {
+            debug.field("source", &"<retained-file>");
+        } else {
+            debug.field("local_path", &self.local_path);
+        }
+        debug
             .field("expected_size", &self.expected_size)
             .field("digest_policy", &self.digest_policy)
             .field("kind", &self.kind)
