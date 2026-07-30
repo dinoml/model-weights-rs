@@ -393,6 +393,131 @@ fn mapped_tensor_view_retains_the_snapshot_guard() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "mmap")]
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "the retained test handle and guard exclude mutation for every mapped-view lifetime"
+)]
+fn mapped_tensor_view_opens_only_the_retained_handle_and_keeps_its_guard() -> Result<()> {
+    struct Guard {
+        drops: Arc<AtomicUsize>,
+        _file: File,
+    }
+
+    impl fmt::Debug for Guard {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Guard")
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let directory = TempDir::new()
+        .map_err(|source| crate::Error::io("test could not create directory", source))?;
+    let path = write_safetensors(
+        &directory,
+        "retained-handle.safetensors",
+        r#"{"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#,
+        &[17],
+    )?;
+    let bytes = std::fs::read(&path)
+        .map_err(|source| crate::Error::io("test could not read checkpoint", source))?;
+    let digest = ContentDigest::from_bytes(Sha256::digest(bytes).into());
+    let size = std::fs::metadata(&path)
+        .map_err(|source| crate::Error::io("test could not inspect checkpoint", source))?
+        .len();
+    let file = File::open(&path)
+        .map_err(|source| crate::Error::io("test could not open checkpoint", source))?;
+    let guard_file = file
+        .try_clone()
+        .map_err(|source| crate::Error::io("test could not clone checkpoint", source))?;
+    let drops = Arc::new(AtomicUsize::new(0));
+    // SAFETY: both retained handles are read-only, and the path is removed
+    // before opening the checkpoint so no later path lookup can replace it.
+    let source = unsafe {
+        SourceDescriptor::retained_file(
+            "weights.safetensors",
+            file,
+            size,
+            digest,
+            Guard {
+                drops: Arc::clone(&drops),
+                _file: guard_file,
+            },
+        )?
+    };
+    let debug = format!("{source:?}");
+    assert!(debug.contains("<retained-file>"));
+    assert!(!debug.contains(&path.to_string_lossy().into_owned()));
+    assert_eq!(
+        source.local_path(),
+        std::path::Path::new("weights.safetensors")
+    );
+    std::fs::remove_file(&path)
+        .map_err(|source| crate::Error::io("test could not unlink checkpoint", source))?;
+
+    let checkpoint = CheckpointBuilder::new(source)
+        .access_mode(AccessMode::Mmap)
+        .open()?;
+    assert_eq!(
+        checkpoint
+            .source_digests(&CancellationToken::new())?
+            .as_ref(),
+        &[digest]
+    );
+    let view = checkpoint.tensor("x")?.bytes().clone();
+    drop(checkpoint);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(view.as_slice(), &[17]);
+    drop(view);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "the wrong declared size is rejected before any retained mapping can be created"
+)]
+fn retained_file_rejects_a_wrong_declared_size() -> Result<()> {
+    let directory = TempDir::new()
+        .map_err(|source| crate::Error::io("test could not create directory", source))?;
+    let path = write_safetensors(
+        &directory,
+        "wrong-size.safetensors",
+        r#"{"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}"#,
+        &[19],
+    )?;
+    let bytes = std::fs::read(&path)
+        .map_err(|source| crate::Error::io("test could not read checkpoint", source))?;
+    let digest = ContentDigest::from_bytes(Sha256::digest(bytes).into());
+    let size = std::fs::metadata(&path)
+        .map_err(|source| crate::Error::io("test could not inspect checkpoint", source))?
+        .len();
+    let file = File::open(path)
+        .map_err(|source| crate::Error::io("test could not open checkpoint", source))?;
+
+    // SAFETY: construction must reject the mismatched declaration before the
+    // source can produce a mapping or trusted byte view.
+    let error = unsafe {
+        SourceDescriptor::retained_file(
+            "weights.safetensors",
+            file,
+            size.saturating_add(1),
+            digest,
+            (),
+        )
+    }
+    .expect_err("a wrong retained-file size must fail");
+    assert_eq!(error.category(), ErrorCategory::Integrity);
+    Ok(())
+}
+
 #[cfg(not(feature = "mmap"))]
 #[test]
 #[expect(
