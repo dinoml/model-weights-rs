@@ -32,7 +32,7 @@ impl ResourceLimits {
         ResourceLimitsBuilder::default()
     }
 
-    /// Returns the maximum bytes allocated for one safetensors header.
+    /// Returns the maximum bytes parsed for one checkpoint header.
     #[must_use]
     pub const fn max_header_bytes(&self) -> u64 {
         self.max_header_bytes
@@ -90,7 +90,7 @@ pub struct ResourceLimitsBuilder {
 }
 
 impl ResourceLimitsBuilder {
-    /// Sets the maximum safetensors header length.
+    /// Sets the maximum checkpoint header length.
     pub const fn max_header_bytes(mut self, value: u64) -> Self {
         self.limits.max_header_bytes = value;
         self

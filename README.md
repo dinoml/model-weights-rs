@@ -5,7 +5,7 @@ model checkpoint bytes into runtime-ready weight deliveries.
 
 It owns:
 
-- bounded safetensors and shard-index inventory;
+- bounded Safetensors, GGUF, and shard-index inventory;
 - deterministic tensor selection, aliases, ordered multi-source target binding,
   typed operation graphs, and overlay plans;
 - versioned dtype/layout preparation and provider recipes;
@@ -26,14 +26,19 @@ for normalized configuration facts.
 
 ## Current scope
 
-Safetensors inputs are parsed with caller-configurable bounds and without
-copying tensor payloads during inventory. Ordinary files use positional reads
-and are hashed only when a content identity is needed. Retained immutable
-snapshots can reuse a previously verified digest and provide zero-copy mapped
-views. Authorizing that mapping is an explicit audited `unsafe` boundary,
-normally contained in the snapshot-store adapter. An upstream-verified digest
-can also be reused for a conservative copied source without asserting mmap
-safety.
+Safetensors and single- or multi-file GGUF inputs are parsed with
+caller-configurable bounds and without copying tensor payloads during
+inventory. GGUF v2 and v3 metadata, including nested arrays, is retained as
+typed values. Every currently file-valid GGML scalar and packed storage type is
+inventoried with its exact block geometry; scalar storage remains plain and
+packed payloads retain their bytes and normalized row-block descriptors.
+Removed, reserved, and unknown GGML type codes fail closed. Ordinary files use
+positional reads and are hashed only when a content identity is needed.
+Retained immutable snapshots can reuse a previously verified digest and
+provide zero-copy mapped views. Authorizing that mapping is an explicit audited
+`unsafe` boundary, normally contained in the snapshot-store adapter. An
+upstream-verified digest can also be reused for a conservative copied source
+without asserting mmap safety.
 
 Binding-plan schema v2 can bind an ordered set of named source tensors to one
 target. A small, versioned operation graph covers N-input concatenation,
@@ -86,6 +91,8 @@ regression comparison.
 - Rust 1.85 or newer, edition 2024.
 - Apache-2.0 licensed.
 - No payload hashing during header-only inventory.
+- A path ending in `.gguf` must contain GGUF magic and never falls back to
+  Safetensors parsing.
 - No implicit quantized decode or dtype conversion.
 - Operation-graph input order is semantic and participates in plan and cache
   identity.

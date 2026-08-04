@@ -17,6 +17,7 @@ mod checkpoint;
 mod error;
 
 pub mod cache;
+pub mod gguf;
 pub mod identity;
 pub mod inventory;
 pub mod limits;
@@ -36,7 +37,8 @@ pub mod tensor;
 pub use cancel::CancellationToken;
 #[doc(inline)]
 pub use checkpoint::{
-    AccessMode, Checkpoint, CheckpointBuilder, PlainTensor, QuantizedTensor, TensorData,
+    AccessMode, Checkpoint, CheckpointBuilder, CheckpointFormat, PlainTensor, QuantizedTensor,
+    TensorData,
 };
 #[doc(inline)]
 pub use error::{Error, ErrorCategory, Result};

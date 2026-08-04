@@ -442,12 +442,15 @@ Device-scratch, direct, fused, and repack routes intentionally do not. Provider
 operation/version, source encoding, backend, and target layout are carried by
 `RouteCapability` and participate in plan/cache identity.
 
-The initial core does not parse GGUF containers or implement GGUF kernels;
-`CheckpointBuilder` is currently safetensors-only. A later `libgguf` or format
-integration must add a bounded GGUF checkpoint source that inventories tensors
-into honest `QuantizedStorage` descriptors and proves their spans, packing,
-block geometry, parameters, companion roles, and byte-access lifetimes. DinoML
-then selects the route according to its actual kernel and memory policy.
+The core parses bounded single- or multi-file GGUF v2 and v3 containers and
+retains typed model metadata, including nested arrays, in file-ordinal order.
+Every currently file-valid GGML scalar and packed storage type is inventoried
+with its exact block geometry. Scalar storage remains plain; packed storage is
+represented by row-blocked `QuantizedStorage` descriptors and delivered
+byte-for-byte. Removed, reserved, and unknown type codes are rejected
+explicitly. DinoML selects `PackedDirect` or another route according to its
+actual kernel and memory policy; this crate does not decode, quantize, or
+upload the payload.
 
 ### Overlay handoffs
 

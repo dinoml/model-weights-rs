@@ -1,4 +1,4 @@
-//! Safe checkpoint opening, bounded safetensors parsing, and byte access.
+//! Safe checkpoint opening, bounded Safetensors and GGUF parsing, and byte access.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -17,6 +17,7 @@ use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest as _, Sha256};
 
+use crate::gguf::{GgufMetadata, ParsedGguf};
 use crate::identity::{ContentDigest, ImplementationId, SnapshotId, StableName};
 use crate::inventory::{DigestState, FileRecord, Inventory, ShardIndex, TensorRecord};
 use crate::limits::ResourceLimits;
@@ -40,6 +41,16 @@ pub enum AccessMode {
     Read,
     /// Require a retained immutable snapshot and return mapped views.
     Mmap,
+}
+
+/// Identifies the parsed checkpoint container format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CheckpointFormat {
+    /// One or more Safetensors files.
+    Safetensors,
+    /// One or more GGUF files.
+    Gguf,
 }
 
 /// Immutable bytes and metadata for one plain tensor.
@@ -162,11 +173,13 @@ struct CheckpointInner {
     inventory: Inventory,
     files: Box<[Arc<OpenFile>]>,
     access: AccessMode,
+    format: CheckpointFormat,
+    gguf_metadata: Box<[GgufMetadata]>,
     snapshot: OnceLock<SnapshotId>,
 }
 
 impl Checkpoint {
-    /// Opens one safetensors file, or a local `*.index.json` shard index.
+    /// Opens one Safetensors or GGUF file, or a local shard index.
     ///
     /// # Errors
     ///
@@ -176,7 +189,7 @@ impl Checkpoint {
         Self::open_with_cancellation(path, &CancellationToken::new())
     }
 
-    /// Opens one safetensors file or local shard index with cancellation.
+    /// Opens one Safetensors or GGUF file, or a local index, with cancellation.
     ///
     /// # Errors
     ///
@@ -222,7 +235,7 @@ impl Checkpoint {
         CheckpointBuilder::new(source).open_with_cancellation(cancellation)
     }
 
-    /// Opens every shard referenced by a local safetensors index.
+    /// Opens every shard referenced by a local Safetensors index.
     ///
     /// Paths are resolved beneath the index directory after canonicalization.
     /// Callers must prevent concurrent mutation of an ordinary local directory
@@ -270,6 +283,29 @@ impl Checkpoint {
     #[must_use]
     pub fn access_mode(&self) -> AccessMode {
         self.inner.access
+    }
+
+    /// Returns the parsed checkpoint container format.
+    #[must_use]
+    pub fn format(&self) -> CheckpointFormat {
+        self.inner.format
+    }
+
+    /// Returns metadata from the first GGUF source, when present.
+    ///
+    /// Use [`Self::gguf_metadata_files`] when a checkpoint has multiple GGUF
+    /// sources.
+    #[must_use]
+    pub fn gguf_metadata(&self) -> Option<&GgufMetadata> {
+        self.inner.gguf_metadata.first()
+    }
+
+    /// Returns GGUF metadata in inventory file-ordinal order.
+    ///
+    /// Safetensors checkpoints return an empty slice.
+    #[must_use]
+    pub fn gguf_metadata_files(&self) -> &[GgufMetadata] {
+        &self.inner.gguf_metadata
     }
 
     /// Reads or maps the exact bytes for a named tensor.
@@ -545,7 +581,7 @@ impl CheckpointBuilder {
         })
     }
 
-    /// Replaces the safetensors shard index used as membership truth.
+    /// Replaces the Safetensors shard index used as membership truth.
     pub fn shard_index(mut self, shard_index: ShardIndex) -> Self {
         self.shard_index = Some(shard_index);
         self
@@ -570,7 +606,7 @@ impl CheckpointBuilder {
     /// # Errors
     ///
     /// Returns an error for empty or duplicate sources, exceeded limits,
-    /// malformed safetensors, or shard-index inconsistencies.
+    /// malformed checkpoint data, or shard-index inconsistencies.
     pub fn open(self) -> Result<Checkpoint> {
         self.open_with_cancellation(&CancellationToken::new())
     }
@@ -624,30 +660,46 @@ impl CheckpointBuilder {
         let mut open_files = Vec::with_capacity(self.sources.len());
         let mut file_records = Vec::with_capacity(self.sources.len());
         let mut tensor_records = Vec::new();
+        let mut format = None;
+        let mut gguf_metadata = Vec::new();
         for (ordinal, source) in self.sources.into_iter().enumerate() {
             cancellation.check()?;
             let ordinal = u32::try_from(ordinal)
                 .map_err(|_error| Error::limit("checkpoint source ordinal exceeds u32"))?;
             let id = FileId::from_ordinal(ordinal);
             let file = Arc::new(OpenFile::open(source, id)?);
-            let parsed = file.parse_header(&self.limits, cancellation)?;
+            let parsed = file.parse_source(&self.limits, cancellation)?;
+            if format.is_some_and(|current| current != parsed.format) {
+                return Err(Error::invalid(
+                    "checkpoint cannot mix Safetensors and GGUF sources",
+                ));
+            }
+            format = Some(parsed.format);
+            if let Some(metadata) = parsed.gguf_metadata {
+                gguf_metadata.push(metadata);
+            }
             let remaining = self
                 .limits
                 .max_tensors()
                 .checked_sub(tensor_records.len())
                 .ok_or_else(|| Error::limit("checkpoint exceeds configured tensor count"))?;
-            if parsed.len() > remaining {
+            if parsed.tensors.len() > remaining {
                 return Err(Error::limit(
                     "checkpoint exceeds the configured tensor count",
                 ));
             }
-            tensor_records.extend(parsed);
+            tensor_records.extend(parsed.tensors);
             file_records.push(file.record());
             open_files.push(file);
         }
         cancellation.check()?;
         let inventory = Inventory::new(file_records, tensor_records)?;
         if let Some(index) = &self.shard_index {
+            if format == Some(CheckpointFormat::Gguf) {
+                return Err(Error::invalid(
+                    "a Safetensors shard index cannot describe a GGUF checkpoint",
+                ));
+            }
             validate_shard_index(index, &inventory, cancellation)?;
         }
         cancellation.check()?;
@@ -657,6 +709,8 @@ impl CheckpointBuilder {
                 inventory,
                 files: open_files.into_boxed_slice(),
                 access: self.access,
+                format: format.unwrap_or(CheckpointFormat::Safetensors),
+                gguf_metadata: gguf_metadata.into_boxed_slice(),
                 snapshot: OnceLock::new(),
             }),
         })
@@ -672,6 +726,13 @@ struct OpenFile {
     digest: Mutex<Option<ContentDigest>>,
     #[cfg(feature = "mmap")]
     mapping: Mutex<Option<Arc<MappedOwner>>>,
+}
+
+#[derive(Debug)]
+struct ParsedSource {
+    format: CheckpointFormat,
+    gguf_metadata: Option<GgufMetadata>,
+    tensors: Vec<TensorRecord>,
 }
 
 impl Debug for OpenFile {
@@ -727,12 +788,49 @@ impl OpenFile {
         )
     }
 
-    fn parse_header(
+    fn parse_source(
+        &self,
+        limits: &ResourceLimits,
+        cancellation: &CancellationToken,
+    ) -> Result<ParsedSource> {
+        cancellation.check()?;
+        if self.size < 4 {
+            return Err(Error::invalid(
+                "checkpoint source is shorter than its magic",
+            ));
+        }
+        let mut magic = [0_u8; 4];
+        read_exact_at(&self.file, 0, &mut magic)?;
+        let gguf_extension = self
+            .source
+            .local_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
+        if magic == *b"GGUF" {
+            let ParsedGguf { metadata, tensors } =
+                crate::gguf::parse(&self.file, self.id, self.size, limits, cancellation)?;
+            return Ok(ParsedSource {
+                format: CheckpointFormat::Gguf,
+                gguf_metadata: Some(metadata),
+                tensors,
+            });
+        }
+        if gguf_extension {
+            return Err(Error::invalid("GGUF source has invalid magic"));
+        }
+        Ok(ParsedSource {
+            format: CheckpointFormat::Safetensors,
+            gguf_metadata: None,
+            tensors: self.parse_safetensors_header(limits, cancellation)?,
+        })
+    }
+
+    fn parse_safetensors_header(
         &self,
         limits: &ResourceLimits,
         cancellation: &CancellationToken,
     ) -> Result<Vec<TensorRecord>> {
-        cancellation.check()?;
         if self.size < 8 {
             return Err(Error::invalid(
                 "safetensors source is shorter than its length prefix",
@@ -1853,7 +1951,7 @@ fn repo_path_to_platform(path: &RepoPath) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn read_exact_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
+pub(crate) fn read_exact_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
     while !bytes.is_empty() {
@@ -1877,7 +1975,7 @@ fn read_exact_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<(
 }
 
 #[cfg(windows)]
-fn read_exact_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
+pub(crate) fn read_exact_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
     use std::os::windows::fs::FileExt as _;
 
     while !bytes.is_empty() {
@@ -1901,7 +1999,7 @@ fn read_exact_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_exact_at(file: &File, offset: u64, bytes: &mut [u8]) -> Result<()> {
+pub(crate) fn read_exact_at(file: &File, offset: u64, bytes: &mut [u8]) -> Result<()> {
     let mut clone = file
         .try_clone()
         .map_err(|source| Error::io("failed to clone checkpoint source handle", source))?;

@@ -10,7 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme = "../../README.md"
-keywords = ["machine-learning", "safetensors", "checkpoint", "weights"]
+keywords = ["machine-learning", "safetensors", "gguf", "checkpoint", "weights"]
 categories = ["science", "filesystem"]
 
 [features]

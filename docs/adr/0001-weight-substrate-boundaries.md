@@ -94,8 +94,10 @@ opaque parameters. A preparation route then declares one of:
 - device dequantization to consumer-managed scratch;
 - repacking to another encoding.
 
-The core does not ship a GGUF decoder in the initial implementation. Libraries
-such as `libgguf`, DinoML kernels, or ecosystem providers can implement routes.
+The core inventories bounded GGUF containers and preserves every currently
+file-valid GGML scalar or packed storage representation, but does not ship a
+GGUF decoder. Libraries such as `libgguf`, DinoML kernels, or ecosystem
+providers can implement routes.
 Provider identity and version participate in plan/prepared cache keys, so a
 kernel or algorithm change cannot silently reuse incompatible bytes.
 
