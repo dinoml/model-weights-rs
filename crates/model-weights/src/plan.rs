@@ -816,9 +816,10 @@ impl TargetTensorBuilder {
         if self.source_shape != self.shape
             && self.conversion_recipe.is_none()
             && self.operation_graph.is_none()
+            && self.quantized_route.is_none()
         {
             return Err(Error::binding(
-                "target source shape differs without a conversion recipe or operation graph",
+                "target source shape differs without a conversion recipe, operation graph, or quantized route",
             ));
         }
         if logical_strides.len() != self.shape.len() {
@@ -1997,9 +1998,14 @@ fn validate_binding(
                     }
                     validate_contiguous_output(target)?;
                 }
-                QuantizedRoute::PackedDirect
-                | QuantizedRoute::FusedInTile
-                | QuantizedRoute::Repack { .. } => {}
+                QuantizedRoute::PackedDirect => {
+                    if target.output_size() != storage.span().len() {
+                        return Err(Error::binding(
+                            "packed-direct output size differs from the source payload span",
+                        ));
+                    }
+                }
+                QuantizedRoute::FusedInTile | QuantizedRoute::Repack { .. } => {}
             }
         }
     }
@@ -2187,6 +2193,7 @@ fn canonical_json(value: &impl Serialize, message: &'static str) -> Result<Box<[
 mod tests {
     use super::*;
     use crate::prepare::builtin_contiguous_implementation;
+    use crate::quantization::{Packing, QuantizedStorage};
     use crate::tensor::{DType, FileId, SourceSpan};
 
     fn stable(value: &str) -> Result<StableName> {
@@ -2702,6 +2709,66 @@ mod tests {
         assert_eq!(
             error.message(),
             "target cannot combine a conversion recipe with a quantized route"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn packed_direct_bridges_logical_and_packed_target_shapes() -> Result<()> {
+        let plan_inputs = inputs();
+        let encoding = ImplementationId::new(stable("ggml")?, stable("q8-0")?, 1);
+        let storage = QuantizedStorage::new(
+            encoding.clone(),
+            [2_u64, 32],
+            SourceSpan::new(FileId::from_ordinal(0), 0, 68)?,
+            Packing::flat_blocks(32, 34)?,
+        )?;
+        let source =
+            SourceTensor::new(tensor("weight")?, [2_u64, 32], Storage::Quantized(storage))?;
+        let capability = RouteCapability::new(
+            encoding,
+            QuantizedRoute::PackedDirect,
+            ImplementationId::new(stable("test-provider")?, stable("packed-direct")?, 1),
+            Some(plan_inputs.backend()),
+            None,
+        )?;
+        let target = TargetTensor::builder(
+            tensor("weight")?,
+            Requirement::Required,
+            [2_u64, 34],
+            Representation::contiguous(DType::U8),
+            68,
+        )
+        .source_shape([2_u64, 32])
+        .quantized_route(capability.clone())
+        .build()?;
+
+        let plan = BindingPlan::builder(plan_inputs.clone())
+            .sources([source.clone()])
+            .targets([target])
+            .build()?;
+        assert_eq!(plan.bindings()[0].target().shape(), &[2, 34]);
+        assert_eq!(plan.bindings()[0].target().source_shape(), &[2, 32]);
+
+        let invalid_target = TargetTensor::builder(
+            tensor("weight")?,
+            Requirement::Required,
+            [2_u64, 33],
+            Representation::contiguous(DType::U8),
+            66,
+        )
+        .source_shape([2_u64, 32])
+        .quantized_route(capability)
+        .build()?;
+        let error = BindingPlan::builder(plan_inputs)
+            .sources([source])
+            .targets([invalid_target])
+            .build()
+            .expect_err("packed-direct target with a different byte size must fail");
+        assert!(
+            error
+                .message()
+                .contains("packed-direct output size differs from the source payload span")
         );
         Ok(())
     }
