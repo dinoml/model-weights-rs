@@ -724,7 +724,9 @@ impl PreparationProvider for ContiguousProvider {
         if source.dtype() == target.dtype() {
             return Ok(OutputStrategy::ReuseSource);
         }
-        if is_builtin_float(source.dtype()) && is_builtin_float(target.dtype()) {
+        if (is_builtin_float(source.dtype()) && is_builtin_float(target.dtype()))
+            || (source.dtype() == DType::U8 && target.dtype() == DType::F32)
+        {
             return Ok(OutputStrategy::Allocate {
                 output_bytes: target_bytes,
                 scratch_bytes: 0,
@@ -860,6 +862,14 @@ fn cast_float_bytes_owned(
     let (source_width, _target_width, elements) =
         validate_float_cast(source_dtype, source, target_dtype, output_len)?;
     match (source_dtype, target_dtype) {
+        (DType::U8, DType::F32) => collect_cast_blocks(
+            source,
+            source_width,
+            elements,
+            output_len,
+            cancellation,
+            |source| f32::from(source[0]).to_le_bytes(),
+        ),
         (DType::F32, DType::F16) => collect_cast_blocks(
             source,
             source_width,
@@ -1008,6 +1018,7 @@ fn validate_float_cast(
 
 fn float_width(dtype: DType) -> Result<usize> {
     match dtype {
+        DType::U8 => Ok(1),
         DType::F32 => Ok(4),
         DType::F16 | DType::Bf16 => Ok(2),
         _ => Err(Error::unsupported(
@@ -1023,6 +1034,11 @@ fn cast_float_block(
     output: &mut [u8],
 ) -> Result<()> {
     match (source_dtype, target_dtype) {
+        (DType::U8, DType::F32) => {
+            for (&value, target) in source.iter().zip(output.chunks_exact_mut(4)) {
+                write_f32(target, f32::from(value))?;
+            }
+        }
         (DType::F32, DType::F16) => {
             for (source, target) in source.chunks_exact(4).zip(output.chunks_exact_mut(2)) {
                 write_u16(target, f16::from_f32(read_f32(source)?).to_bits())?;
@@ -1147,6 +1163,29 @@ mod initialized_cast_tests {
             &cancellation,
         )?;
         assert_eq!(actual.as_ref(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn u8_to_f32_preserves_every_byte_across_blocks() -> Result<()> {
+        let source: Vec<u8> = (u8::MIN..=u8::MAX)
+            .cycle()
+            .take(CAST_BLOCK_ELEMENTS + 257)
+            .collect();
+        assert_owned_matches_slice_writer(DType::U8, &source, DType::F32)?;
+        let token = CancellationToken::new();
+        let actual =
+            cast_float_bytes_owned(DType::U8, &source, DType::F32, source.len() * 4, &token)?;
+        let expected: Vec<u8> = source
+            .iter()
+            .flat_map(|&v| f32::from(v).to_le_bytes())
+            .collect();
+        assert_eq!(actual.as_ref(), expected);
+        cast_float_bytes_owned(DType::U8, &source, DType::F32, source.len(), &token)
+            .expect_err("incorrect output length must fail");
+        token.cancel();
+        cast_float_bytes_owned(DType::U8, &source, DType::F32, source.len() * 4, &token)
+            .expect_err("cancelled conversion must fail");
         Ok(())
     }
 
