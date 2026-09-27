@@ -861,6 +861,13 @@ fn cast_float_bytes_owned(
 ) -> Result<Box<[u8]>> {
     let (source_width, _target_width, elements) =
         validate_float_cast(source_dtype, source, target_dtype, output_len)?;
+    if target_dtype == DType::Bf16 {
+        if let Some(output) =
+            crate::prepare_simd::cast_to_bf16(source_dtype, source, output_len, cancellation)?
+        {
+            return Ok(output);
+        }
+    }
     match (source_dtype, target_dtype) {
         (DType::U8, DType::F32) => collect_cast_blocks(
             source,
@@ -1199,6 +1206,60 @@ mod initialized_cast_tests {
         assert_owned_matches_slice_writer(DType::F16, &all_half_bits, DType::Bf16)?;
         assert_owned_matches_slice_writer(DType::Bf16, &all_half_bits, DType::F32)?;
         assert_owned_matches_slice_writer(DType::Bf16, &all_half_bits, DType::F16)
+    }
+
+    #[test]
+    #[ignore = "manual throughput comparison; run in release mode on an idle host"]
+    fn benchmark_bulk_bfloat_conversion() -> Result<()> {
+        let count = 16 * 1024 * 1024;
+        for dtype in [DType::F16, DType::F32] {
+            let source = if dtype == DType::F16 {
+                f16::from_f32(1.234).to_bits().to_le_bytes().repeat(count)
+            } else {
+                1.234_f32.to_le_bytes().repeat(count)
+            };
+            let token = CancellationToken::new();
+            let start = std::time::Instant::now();
+            let mut scalar = vec![0; count * 2];
+            cast_float_bytes(dtype, &source, DType::Bf16, &mut scalar, &token)?;
+            let scalar_time = start.elapsed();
+            let start = std::time::Instant::now();
+            let bulk = cast_float_bytes_owned(dtype, &source, DType::Bf16, scalar.len(), &token)?;
+            let bulk_time = start.elapsed();
+            assert_eq!(bulk.as_ref(), scalar);
+            eprintln!(
+                "{dtype:?} -> BF16: scalar {scalar_time:?}, bulk {bulk_time:?}, input {} bytes",
+                source.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_bfloat_conversion_preserves_rounding_nan_payloads_and_tails() -> Result<()> {
+        let bytes: Vec<u8> = (u16::MIN..=u16::MAX)
+            .flat_map(|high| {
+                [0_u32, 0x7fff, 0x8000, 0x8001, 0xffff]
+                    .into_iter()
+                    .flat_map(move |low| ((u32::from(high) << 16) | low).to_le_bytes())
+            })
+            .collect();
+        assert_owned_matches_slice_writer(DType::F32, &bytes, DType::Bf16)?;
+        for length in 0..17 {
+            assert_owned_matches_slice_writer(DType::F32, &bytes[..length * 4], DType::Bf16)?;
+            assert_owned_matches_slice_writer(DType::F16, &bytes[..length * 2], DType::Bf16)?;
+        }
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        cast_float_bytes_owned(
+            DType::F32,
+            &bytes,
+            DType::Bf16,
+            bytes.len() / 2,
+            &cancellation,
+        )
+        .expect_err("cancelled SIMD conversion must fail");
+        Ok(())
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub mod overlay;
 pub mod pipeline;
 pub mod plan;
 pub mod prepare;
+mod prepare_simd;
 pub mod quantization;
 pub mod source;
 pub mod telemetry;
