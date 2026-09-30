@@ -1692,7 +1692,7 @@ fn execute_permute_node(
             transient_scratch: 0,
         });
     }
-    if let Some(output) = build_oihw_to_ohwi_if_supported(
+    if let Some(output) = build_convolution_channels_last_if_supported(
         permute,
         input_facts,
         output_facts,
@@ -2174,32 +2174,36 @@ fn execute_storage_copy(
     cancellation.check()
 }
 
-fn build_oihw_to_ohwi_if_supported(
+fn build_convolution_channels_last_if_supported(
     permute: &Permute,
     input_facts: &TensorFacts,
     output_facts: &TensorFacts,
     input: &[u8],
     cancellation: &CancellationToken,
 ) -> Result<Option<Box<[u8]>>> {
+    let shape = input_facts.logical_shape();
+    let channels_last = match shape.len() {
+        3 => permute.order() == [0, 2, 1],
+        4 => permute.order() == [0, 2, 3, 1],
+        5 => permute.order() == [0, 2, 3, 4, 1],
+        _ => false,
+    };
     if !matches!(permute.mode(), PermuteMode::Storage { .. })
-        || permute.order() != [0, 2, 3, 1]
+        || !channels_last
         || !input_facts.is_canonical_contiguous()
     {
         return Ok(None);
     }
     cancellation.check()?;
-    let [output_channels, input_channels, kernel_height, kernel_width] =
-        input_facts.logical_shape()
-    else {
-        return Ok(None);
-    };
-    let output_channels = dimension_as_usize(*output_channels)?;
-    let input_channels = dimension_as_usize(*input_channels)?;
-    let kernel_height = dimension_as_usize(*kernel_height)?;
-    let kernel_width = dimension_as_usize(*kernel_width)?;
-    let spatial = kernel_height
-        .checked_mul(kernel_width)
-        .ok_or_else(|| Error::limit("OIHW spatial element count overflows usize"))?;
+    let output_channels = dimension_as_usize(shape[0])?;
+    let input_channels = dimension_as_usize(shape[1])?;
+    // All spatial axes are contiguous in both layouts. Flatten them once;
+    // avoid generic per-element coordinate division for large 3D weights.
+    let spatial = shape[2..].iter().try_fold(1_usize, |product, &extent| {
+        product
+            .checked_mul(dimension_as_usize(extent)?)
+            .ok_or_else(|| Error::limit("convolution spatial element count overflows usize"))
+    })?;
     let output_channel_elements = input_channels
         .checked_mul(spatial)
         .ok_or_else(|| Error::limit("OIHW output-channel element count overflows usize"))?;
@@ -2226,7 +2230,8 @@ fn build_oihw_to_ohwi_if_supported(
             elements,
             cancellation,
         )?,
-        2 if spatial == 9
+        2 if shape.len() == 4
+            && spatial == 9
             && matches!(
                 input_facts.representation().dtype(),
                 DType::F16 | DType::Bf16
@@ -3575,6 +3580,55 @@ mod tests {
             let execution = graph.execute_host(&[input], &engine, &CancellationToken::new())?;
 
             assert_eq!(execution.output().as_slice(), expected, "dtype {dtype:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn convolution_channels_last_storage_matches_generic_copy() -> Result<()> {
+        for shape in [
+            vec![2, 19, 3],
+            vec![2, 19, 1, 3, 3],
+            vec![2, 19, 3, 3, 3],
+            vec![1, 7, 1, 1, 1],
+            vec![2, 5, 2, 3, 4],
+        ] {
+            for (dtype, width) in [
+                (DType::U8, 1_usize),
+                (DType::F16, 2),
+                (DType::Bf16, 2),
+                (DType::F32, 4),
+                (DType::F64, 8),
+            ] {
+                let facts = contiguous(&shape, dtype)?;
+                let elements = usize::try_from(facts.element_count()).expect("small test tensor");
+                let bytes = (0..elements * width)
+                    .map(|i| u8::try_from((i * 37 + 11) % 251).expect("value fits u8"))
+                    .collect::<Vec<_>>();
+                let mut order = vec![0];
+                order.extend(2..u32::try_from(shape.len()).expect("small rank"));
+                order.push(1);
+                let permute = Permute::storage(order, custom_layout("test/channels-last")?)?;
+                let output = infer_permute(&permute, &facts)?;
+                let token = CancellationToken::new();
+                let fast = build_convolution_channels_last_if_supported(
+                    &permute, &facts, &output[0], &bytes, &token,
+                )?
+                .expect("canonical convolution is admitted");
+                let input = ByteView::from_boxed(bytes.into_boxed_slice());
+                let mut expected = vec![0; fast.len()];
+                execute_storage_copy(&facts, &output[0], &input, &mut expected, &token)?;
+                assert_eq!(&*fast, expected, "shape {shape:?}, dtype {dtype:?}");
+                token.cancel();
+                build_convolution_channels_last_if_supported(
+                    &permute,
+                    &facts,
+                    &output[0],
+                    input.as_slice(),
+                    &token,
+                )
+                .expect_err("cancelled convolution transpose must fail");
+            }
         }
         Ok(())
     }
