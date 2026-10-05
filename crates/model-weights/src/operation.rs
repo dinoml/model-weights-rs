@@ -2090,8 +2090,27 @@ fn execute_permute_bytes(
         return execute_storage_copy(input_facts, output_facts, input, output, cancellation);
     }
     let width = dtype_width(input_facts.representation().dtype())?;
-    let output_row_strides = contiguous_strides(output_facts.logical_shape())?;
+    let rank = input_facts.logical_shape().len();
     let order = permutation_indices(permute.order())?;
+    if rank >= 2
+        && input_facts.is_canonical_contiguous()
+        && output_facts.is_canonical_contiguous()
+        && order[..rank - 2].iter().copied().eq(0..rank - 2)
+        && order[rank - 2..] == [rank - 1, rank - 2]
+    {
+        let rows = dimension_as_usize(input_facts.logical_shape()[rank - 2])?;
+        let columns = dimension_as_usize(input_facts.logical_shape()[rank - 1])?;
+        return match width {
+            1 => transpose_matrix_banks::<1>(input.as_slice(), output, rows, columns, cancellation),
+            2 => transpose_matrix_banks::<2>(input.as_slice(), output, rows, columns, cancellation),
+            4 => transpose_matrix_banks::<4>(input.as_slice(), output, rows, columns, cancellation),
+            8 => transpose_matrix_banks::<8>(input.as_slice(), output, rows, columns, cancellation),
+            _ => Err(Error::binding(
+                "unsupported scalar width for matrix transpose",
+            )),
+        };
+    }
+    let output_row_strides = contiguous_strides(output_facts.logical_shape())?;
 
     for linear in 0..output_facts.element_count() {
         check_copy_cancellation(linear, cancellation)?;
@@ -2122,6 +2141,42 @@ fn execute_permute_bytes(
             target_element,
             width,
         )?;
+    }
+    cancellation.check()
+}
+
+// Transpose opaque elements without coordinate division or numeric conversion.
+// Blocking keeps source and destination cache lines live for each matrix tile.
+fn transpose_matrix_banks<const WIDTH: usize>(
+    input: &[u8],
+    output: &mut [u8],
+    rows: usize,
+    columns: usize,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let matrix_bytes = rows
+        .checked_mul(columns)
+        .and_then(|n| n.checked_mul(WIDTH))
+        .ok_or_else(|| Error::binding("matrix transpose byte size overflow"))?;
+    if matrix_bytes == 0 {
+        return cancellation.check();
+    }
+    for (source, target) in input
+        .chunks_exact(matrix_bytes)
+        .zip(output.chunks_exact_mut(matrix_bytes))
+    {
+        for row_start in (0..rows).step_by(32) {
+            for column_start in (0..columns).step_by(32) {
+                cancellation.check()?;
+                for row in row_start..rows.min(row_start + 32) {
+                    for column in column_start..columns.min(column_start + 32) {
+                        let from = (row * columns + column) * WIDTH;
+                        let to = (column * rows + row) * WIDTH;
+                        target[to..to + WIDTH].copy_from_slice(&source[from..from + WIDTH]);
+                    }
+                }
+            }
+        }
     }
     cancellation.check()
 }
@@ -3703,6 +3758,40 @@ mod tests {
                         expected,
                         "dtype {dtype:?}, channels {input_channels}, pattern {pattern}"
                     );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn matrix_bank_transpose_preserves_opaque_bytes_and_partial_tiles() -> Result<()> {
+        for dtype in [DType::U8, DType::Bf16, DType::F32, DType::F64] {
+            let width = dtype_width(dtype)?;
+            let mut builder = OperationGraph::builder();
+            let input = builder.add_input(name("bank")?, contiguous(&[3, 35, 67], dtype)?)?;
+            let outputs = add_operation(
+                &mut builder,
+                Operation::Permute(Permute::logical([0, 2, 1])?),
+                vec![input],
+            )?;
+            let graph = builder.build(outputs[0])?;
+            let bytes = (0..3 * 35 * 67 * width)
+                .map(|n| u8::try_from(n % 251).unwrap())
+                .collect::<Vec<_>>();
+            let input = ByteView::from_boxed(bytes.clone().into_boxed_slice());
+            let engine = PreparationEngine::with_builtins()?;
+            let execution = graph.execute_host(&[input], &engine, &CancellationToken::new())?;
+            for bank in 0..3 {
+                for row in 0..35 {
+                    for column in 0..67 {
+                        let from = ((bank * 35 + row) * 67 + column) * width;
+                        let to = ((bank * 67 + column) * 35 + row) * width;
+                        assert_eq!(
+                            &execution.output().as_slice()[to..to + width],
+                            &bytes[from..from + width]
+                        );
+                    }
                 }
             }
         }
