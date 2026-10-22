@@ -46,6 +46,8 @@ pub enum OperationKind {
     Cast,
     /// Multiple tensors were concatenated along one axis.
     Concat,
+    /// Logical weight normalization in FP32.
+    WeightNorm,
     /// Tensor axes or physical storage were permuted.
     Permute,
     /// Logical values were copied into larger zero-padded physical storage.
@@ -68,6 +70,7 @@ impl OperationKind {
             Self::Identity => "identity",
             Self::Cast => "cast",
             Self::Concat => "concat",
+            Self::WeightNorm => "weight_norm",
             Self::Permute => "permute",
             Self::Pad => "pad",
             Self::Slice => "slice",

@@ -212,7 +212,9 @@ pub struct ByteView {
 }
 
 impl ByteView {
-    pub(crate) fn from_boxed(bytes: Box<[u8]>) -> Self {
+    /// Takes ownership of immutable bytes without copying their payload.
+    #[must_use]
+    pub fn from_boxed(bytes: Box<[u8]>) -> Self {
         let length = bytes.len();
         Self {
             owner: Arc::new(bytes),

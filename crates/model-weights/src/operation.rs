@@ -23,6 +23,10 @@ use crate::telemetry::{ExecutionEvent, ExecutionObserver, OperationKind, Operati
 use crate::tensor::{ByteView, DType};
 use crate::{CancellationToken, Error, ErrorCategory, Result};
 
+mod weight_norm;
+pub use weight_norm::WeightNorm;
+use weight_norm::{execute_weight_norm, infer_weight_norm};
+
 /// The canonical operation-graph schema version.
 pub const OPERATION_GRAPH_SCHEMA_VERSION: u32 = 1;
 
@@ -566,6 +570,8 @@ impl Reshape {
 pub enum Operation {
     /// N-input logical concatenation.
     Concat(Concat),
+    /// FP32 logical weight normalization from gain and direction.
+    WeightNorm(WeightNorm),
     /// Logical or physical axis permutation.
     Permute(Permute),
     /// Zero-padded physical storage permutation.
@@ -597,6 +603,7 @@ impl Operation {
         }
         let operation = match self {
             Self::Concat(_) => "concat",
+            Self::WeightNorm(_) => "weight_norm",
             Self::Permute(_) => "permute",
             Self::Pad(_) => "pad",
             Self::Slice(_) => "slice",
@@ -1011,7 +1018,8 @@ impl OperationGraph {
             {
                 Some(0)
             }
-            Operation::Concat(_)
+            Operation::WeightNorm(_)
+            | Operation::Concat(_)
             | Operation::Permute(_)
             | Operation::Pad(_)
             | Operation::Slice(_)
@@ -1065,7 +1073,8 @@ impl OperationGraph {
             }
             let transient = match node.operation() {
                 Operation::Prepare(transform) => transform.scratch_bytes(),
-                Operation::Concat(_)
+                Operation::WeightNorm(_)
+                | Operation::Concat(_)
                 | Operation::Permute(_)
                 | Operation::Pad(_)
                 | Operation::Slice(_)
@@ -1595,6 +1604,7 @@ enum OutputOrigin {
 fn operation_kind(operation: &Operation, materialized_output_bytes: u64) -> OperationKind {
     match operation {
         Operation::Concat(_) => OperationKind::Concat,
+        Operation::WeightNorm(_) => OperationKind::WeightNorm,
         Operation::Permute(_) => OperationKind::Permute,
         Operation::Pad(_) => OperationKind::Pad,
         Operation::Slice(_) => OperationKind::Slice,
@@ -1618,6 +1628,9 @@ fn execute_node(
         ));
     }
     match node.operation() {
+        Operation::WeightNorm(operation) => {
+            execute_weight_norm(*operation, node, inputs, input_facts, cancellation)
+        }
         Operation::Concat(concat) => {
             execute_concat_node(*concat, node, inputs, input_facts, cancellation)
         }
@@ -2611,6 +2624,7 @@ fn index_as_u32(index: usize, description: &'static str) -> Result<u32> {
 fn infer_outputs(operation: &Operation, inputs: &[&TensorFacts]) -> Result<Box<[TensorFacts]>> {
     match operation {
         Operation::Concat(concat) => infer_concat(*concat, inputs),
+        Operation::WeightNorm(operation) => infer_weight_norm(*operation, inputs),
         Operation::Permute(permute) => infer_permute(permute, one_input(inputs)?),
         Operation::Pad(pad) => infer_pad(pad, one_input(inputs)?),
         Operation::Slice(slice) => infer_slice(slice, one_input(inputs)?),
