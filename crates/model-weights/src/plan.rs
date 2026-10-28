@@ -354,6 +354,15 @@ pub struct SourceTensor {
     name: TensorName,
     shape: Box<[u64]>,
     storage: Storage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row_slice: Option<RowSliceSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RowSliceSource {
+    pub(crate) source: TensorName,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
 }
 
 impl SourceTensor {
@@ -386,6 +395,7 @@ impl SourceTensor {
             name,
             shape,
             storage,
+            row_slice: None,
         })
     }
 
@@ -406,6 +416,58 @@ impl SourceTensor {
     pub const fn storage(&self) -> &Storage {
         &self.storage
     }
+
+    /// Create a named, zero-copy view of complete contiguous matrix rows.
+    ///
+    /// # Errors
+    /// Rejects invalid matrix ranges, unsupported packed layouts and overflow.
+    pub fn slice_rows(&self, name: TensorName, start: u64, end: u64) -> Result<Self> {
+        if self.shape.len() != 2 || start >= end || end > self.shape[0] {
+            return Err(Error::binding("row slice exceeds the source matrix"));
+        }
+        let shape = vec![end - start, self.shape[1]];
+        let storage = match &self.storage {
+            Storage::Plain { dtype, span } => {
+                let row_bytes = dtype.byte_len(&self.shape[1..])?;
+                let offset = start
+                    .checked_mul(row_bytes)
+                    .and_then(|value| span.offset().checked_add(value))
+                    .ok_or_else(|| Error::limit("row slice offset overflows"))?;
+                let length = (end - start)
+                    .checked_mul(row_bytes)
+                    .ok_or_else(|| Error::limit("row slice extent overflows"))?;
+                Storage::Plain {
+                    dtype: *dtype,
+                    span: crate::tensor::SourceSpan::new(span.file(), offset, length)?,
+                }
+            }
+            Storage::Quantized(storage) => Storage::Quantized(storage.slice_rows(start, end)?),
+        };
+        let mut output = Self::new(name, shape, storage)?;
+        let (source, base) = self
+            .row_slice
+            .as_ref()
+            .map_or((&self.name, 0), |view| (&view.source, view.start));
+        if source == &output.name {
+            return Err(Error::binding(
+                "a row view must have a distinct source name",
+            ));
+        }
+        output.row_slice = Some(RowSliceSource {
+            source: source.clone(),
+            start: base
+                .checked_add(start)
+                .ok_or_else(|| Error::limit("row view start overflows"))?,
+            end: base
+                .checked_add(end)
+                .ok_or_else(|| Error::limit("row view end overflows"))?,
+        });
+        Ok(output)
+    }
+
+    pub(crate) fn row_slice_source(&self) -> Option<&RowSliceSource> {
+        self.row_slice.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -413,13 +475,26 @@ struct SourceTensorWire {
     name: TensorName,
     shape: Box<[u64]>,
     storage: Storage,
+    #[serde(default)]
+    row_slice: Option<RowSliceSource>,
 }
 
 impl TryFrom<SourceTensorWire> for SourceTensor {
     type Error = Error;
 
     fn try_from(wire: SourceTensorWire) -> Result<Self> {
-        Self::new(wire.name, wire.shape, wire.storage)
+        let mut source = Self::new(wire.name, wire.shape, wire.storage)?;
+        if let Some(view) = wire.row_slice {
+            if source.shape.len() != 2
+                || view.start >= view.end
+                || source.shape[0] != view.end - view.start
+                || view.source == source.name
+            {
+                return Err(Error::binding("invalid source row-view provenance"));
+            }
+            source.row_slice = Some(view);
+        }
+        Ok(source)
     }
 }
 

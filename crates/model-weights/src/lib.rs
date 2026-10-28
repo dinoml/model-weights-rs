@@ -17,6 +17,7 @@ mod checkpoint;
 mod error;
 
 pub mod cache;
+pub mod comfy;
 pub mod gguf;
 pub mod identity;
 pub mod inventory;

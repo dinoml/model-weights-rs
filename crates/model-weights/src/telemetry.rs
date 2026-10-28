@@ -40,6 +40,8 @@ pub enum ExecutionPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum OperationKind {
+    /// Encoded weights and companions were bundled without dequantization.
+    ComfyPack,
     /// The source representation was retained without materializing bytes.
     Identity,
     /// A provider changed the scalar dtype.
@@ -67,6 +69,7 @@ impl OperationKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ComfyPack => "comfy_pack",
             Self::Identity => "identity",
             Self::Cast => "cast",
             Self::Concat => "concat",

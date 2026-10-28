@@ -418,6 +418,53 @@ impl QuantizedStorage {
     pub const fn metadata(&self) -> &BTreeMap<StableName, MetadataValue> {
         &self.metadata
     }
+
+    /// Describe complete matrix rows without decoding or copying their blocks.
+    ///
+    /// # Errors
+    /// Rejects invalid ranges, opaque or cross-row packing, companion/grouped
+    /// layouts, and overflowing byte extents.
+    pub fn slice_rows(&self, start: u64, end: u64) -> Result<Self> {
+        if self.logical_shape.len() != 2 || start >= end || end > self.logical_shape[0] {
+            return Err(Error::binding("packed row slice exceeds the source matrix"));
+        }
+        if self.grouping.is_some()
+            || !self.companions.is_empty()
+            || !self.required_companions.is_empty()
+        {
+            return Err(Error::unsupported(
+                "packed row slicing requires self-contained blocks",
+            ));
+        }
+        let Packing::Blocks(blocks) = self.packing else {
+            return Err(Error::unsupported(
+                "opaque storage cannot be sliced by rows",
+            ));
+        };
+        let width = self.logical_shape[1];
+        if !matches!(blocks.order(), PackingOrder::Flat | PackingOrder::Axis(1))
+            || width % u64::from(blocks.values_per_block()) != 0
+        {
+            return Err(Error::unsupported(
+                "quantized blocks must fit complete matrix rows",
+            ));
+        }
+        let row_bytes = (width / u64::from(blocks.values_per_block()))
+            .checked_mul(u64::from(blocks.bytes_per_block()))
+            .ok_or_else(|| Error::limit("packed row size overflows"))?;
+        let offset = start
+            .checked_mul(row_bytes)
+            .and_then(|value| self.payload.offset().checked_add(value))
+            .ok_or_else(|| Error::limit("packed row offset overflows"))?;
+        let length = (end - start)
+            .checked_mul(row_bytes)
+            .ok_or_else(|| Error::limit("packed row extent overflows"))?;
+        let mut output = self.clone();
+        output.logical_shape[0] = end - start;
+        output.payload = SourceSpan::new(self.payload.file(), offset, length)?;
+        validate_shape_and_packing(&output.logical_shape, output.payload, output.packing)?;
+        Ok(output)
+    }
 }
 
 /// Builds a validated quantized storage descriptor.

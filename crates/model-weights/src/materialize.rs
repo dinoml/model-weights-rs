@@ -1801,7 +1801,13 @@ fn validate_complete_plan_inventory(
         cancellation.check()?;
         validate_inventory_source(checkpoint, source)?;
     }
-    if plan.sources().len() != checkpoint.inventory().len() {
+    if plan
+        .sources()
+        .iter()
+        .filter(|source| source.row_slice_source().is_none())
+        .count()
+        != checkpoint.inventory().len()
+    {
         return Err(Error::integrity(
             "binding plan source inventory omits an opened checkpoint tensor",
         ));
@@ -1828,6 +1834,25 @@ fn validate_complete_plan_inventory(
 }
 
 fn validate_inventory_source(checkpoint: &Checkpoint, source: &SourceTensor) -> Result<()> {
+    if let Some(view) = source.row_slice_source() {
+        let record = checkpoint
+            .inventory()
+            .tensor(view.source.as_str())
+            .ok_or_else(|| {
+                Error::binding("row-view origin is absent from the opened checkpoint")
+            })?;
+        let expected = SourceTensor::try_from(record)?.slice_rows(
+            source.name().clone(),
+            view.start,
+            view.end,
+        )?;
+        if source != &expected {
+            return Err(Error::integrity(
+                "source row-view descriptor differs from its checkpoint origin",
+            ));
+        }
+        return Ok(());
+    }
     let record = checkpoint
         .inventory()
         .tensor(source.name().as_str())

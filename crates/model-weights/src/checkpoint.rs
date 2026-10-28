@@ -175,6 +175,7 @@ struct CheckpointInner {
     access: AccessMode,
     format: CheckpointFormat,
     gguf_metadata: Box<[GgufMetadata]>,
+    comfy_metadata: BTreeMap<Box<str>, serde_json::Value>,
     snapshot: OnceLock<SnapshotId>,
 }
 
@@ -306,6 +307,10 @@ impl Checkpoint {
     #[must_use]
     pub fn gguf_metadata_files(&self) -> &[GgufMetadata] {
         &self.inner.gguf_metadata
+    }
+
+    pub(crate) fn comfy_layer_metadata(&self, layer: &str) -> Option<&serde_json::Value> {
+        self.inner.comfy_metadata.get(layer)
     }
 
     /// Reads or maps the exact bytes for a named tensor.
@@ -662,6 +667,7 @@ impl CheckpointBuilder {
         let mut tensor_records = Vec::new();
         let mut format = None;
         let mut gguf_metadata = Vec::new();
+        let mut comfy_metadata = BTreeMap::new();
         for (ordinal, source) in self.sources.into_iter().enumerate() {
             cancellation.check()?;
             let ordinal = u32::try_from(ordinal)
@@ -677,6 +683,9 @@ impl CheckpointBuilder {
             format = Some(parsed.format);
             if let Some(metadata) = parsed.gguf_metadata {
                 gguf_metadata.push(metadata);
+            }
+            if let Some(metadata) = parsed.quantization_metadata {
+                crate::comfy::merge_layer_metadata(&mut comfy_metadata, &metadata)?;
             }
             let remaining = self
                 .limits
@@ -711,6 +720,7 @@ impl CheckpointBuilder {
                 access: self.access,
                 format: format.unwrap_or(CheckpointFormat::Safetensors),
                 gguf_metadata: gguf_metadata.into_boxed_slice(),
+                comfy_metadata,
                 snapshot: OnceLock::new(),
             }),
         })
@@ -732,6 +742,7 @@ struct OpenFile {
 struct ParsedSource {
     format: CheckpointFormat,
     gguf_metadata: Option<GgufMetadata>,
+    quantization_metadata: Option<Box<str>>,
     tensors: Vec<TensorRecord>,
 }
 
@@ -813,24 +824,21 @@ impl OpenFile {
             return Ok(ParsedSource {
                 format: CheckpointFormat::Gguf,
                 gguf_metadata: Some(metadata),
+                quantization_metadata: None,
                 tensors,
             });
         }
         if gguf_extension {
             return Err(Error::invalid("GGUF source has invalid magic"));
         }
-        Ok(ParsedSource {
-            format: CheckpointFormat::Safetensors,
-            gguf_metadata: None,
-            tensors: self.parse_safetensors_header(limits, cancellation)?,
-        })
+        self.parse_safetensors_header(limits, cancellation)
     }
 
     fn parse_safetensors_header(
         &self,
         limits: &ResourceLimits,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<TensorRecord>> {
+    ) -> Result<ParsedSource> {
         if self.size < 8 {
             return Err(Error::invalid(
                 "safetensors source is shorter than its length prefix",
@@ -872,16 +880,23 @@ impl OpenFile {
             read_exact_at(&self.file, offset, block)?;
         }
         cancellation.check()?;
-        let raw = parse_header_json(&header, limits, cancellation)?;
+        let mut raw = parse_header_json(&header, limits, cancellation)?;
+        let quantization_metadata = raw.quantization_metadata.take();
         cancellation.check()?;
-        validate_tensor_entries(
+        let tensors = validate_tensor_entries(
             self.id,
             data_base,
             self.size - data_base,
             raw,
             limits,
             cancellation,
-        )
+        )?;
+        Ok(ParsedSource {
+            format: CheckpointFormat::Safetensors,
+            gguf_metadata: None,
+            quantization_metadata,
+            tensors,
+        })
     }
 
     fn read_span(
@@ -1134,6 +1149,7 @@ struct RawTensor {
 #[derive(Debug)]
 struct RawHeader {
     tensors: BTreeMap<Box<str>, RawTensor>,
+    quantization_metadata: Option<Box<str>>,
 }
 
 fn parse_header_json(
@@ -1285,6 +1301,7 @@ impl<'de> Visitor<'de> for HeaderVisitor<'_, '_> {
     {
         let mut tensors = BTreeMap::new();
         let mut seen_metadata = false;
+        let mut quantization_metadata = None;
         loop {
             self.control.check()?;
             let Some(name) = map.next_key_seed(HeaderStringSeed {
@@ -1308,7 +1325,7 @@ impl<'de> Visitor<'de> for HeaderVisitor<'_, '_> {
                     ));
                 }
                 seen_metadata = true;
-                map.next_value_seed(MetadataSeed {
+                quantization_metadata = map.next_value_seed(MetadataSeed {
                     control: self.control,
                 })?;
                 continue;
@@ -1333,7 +1350,10 @@ impl<'de> Visitor<'de> for HeaderVisitor<'_, '_> {
             })?;
             tensors.insert(name, raw);
         }
-        Ok(RawHeader { tensors })
+        Ok(RawHeader {
+            tensors,
+            quantization_metadata,
+        })
     }
 }
 
@@ -1594,7 +1614,7 @@ struct MetadataSeed<'control, 'context> {
 }
 
 impl<'de> DeserializeSeed<'de> for MetadataSeed<'_, '_> {
-    type Value = usize;
+    type Value = Option<Box<str>>;
 
     fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
     where
@@ -1612,7 +1632,7 @@ struct MetadataVisitor<'control, 'context> {
 }
 
 impl<'de> Visitor<'de> for MetadataVisitor<'_, '_> {
-    type Value = usize;
+    type Value = Option<Box<str>>;
 
     fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str("a safetensors string metadata map")
@@ -1624,6 +1644,7 @@ impl<'de> Visitor<'de> for MetadataVisitor<'_, '_> {
     {
         let mut seen = BTreeSet::new();
         let mut bytes = 0_usize;
+        let mut quantization_metadata = None;
         loop {
             self.control.check()?;
             let remaining = self
@@ -1658,8 +1679,11 @@ impl<'de> Visitor<'de> for MetadataVisitor<'_, '_> {
                 limit_message: "safetensors metadata exceeds configured limits",
             })?;
             bytes += value.len();
+            if key.as_ref() == "_quantization_metadata" {
+                quantization_metadata = Some(value);
+            }
         }
-        Ok(bytes)
+        Ok(quantization_metadata)
     }
 }
 

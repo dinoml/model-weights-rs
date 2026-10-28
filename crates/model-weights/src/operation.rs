@@ -23,7 +23,9 @@ use crate::telemetry::{ExecutionEvent, ExecutionObserver, OperationKind, Operati
 use crate::tensor::{ByteView, DType};
 use crate::{CancellationToken, Error, ErrorCategory, Result};
 
+mod comfy_pack;
 mod weight_norm;
+use comfy_pack::{execute_comfy_pack, infer_comfy_pack};
 pub use weight_norm::WeightNorm;
 use weight_norm::{execute_weight_norm, infer_weight_norm};
 
@@ -568,6 +570,8 @@ impl Reshape {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "parameters", rename_all = "snake_case")]
 pub enum Operation {
+    /// Lossless bundle of encoded weights and independently typed companions.
+    ComfyPack(crate::comfy::ComfyPack),
     /// N-input logical concatenation.
     Concat(Concat),
     /// FP32 logical weight normalization from gain and direction.
@@ -602,6 +606,7 @@ impl Operation {
             return Ok(transform.transform().implementation().clone());
         }
         let operation = match self {
+            Self::ComfyPack(_) => "comfy_pack",
             Self::Concat(_) => "concat",
             Self::WeightNorm(_) => "weight_norm",
             Self::Permute(_) => "permute",
@@ -1018,7 +1023,8 @@ impl OperationGraph {
             {
                 Some(0)
             }
-            Operation::WeightNorm(_)
+            Operation::ComfyPack(_)
+            | Operation::WeightNorm(_)
             | Operation::Concat(_)
             | Operation::Permute(_)
             | Operation::Pad(_)
@@ -1073,7 +1079,8 @@ impl OperationGraph {
             }
             let transient = match node.operation() {
                 Operation::Prepare(transform) => transform.scratch_bytes(),
-                Operation::WeightNorm(_)
+                Operation::ComfyPack(_)
+                | Operation::WeightNorm(_)
                 | Operation::Concat(_)
                 | Operation::Permute(_)
                 | Operation::Pad(_)
@@ -1603,6 +1610,7 @@ enum OutputOrigin {
 
 fn operation_kind(operation: &Operation, materialized_output_bytes: u64) -> OperationKind {
     match operation {
+        Operation::ComfyPack(_) => OperationKind::ComfyPack,
         Operation::Concat(_) => OperationKind::Concat,
         Operation::WeightNorm(_) => OperationKind::WeightNorm,
         Operation::Permute(_) => OperationKind::Permute,
@@ -1628,6 +1636,9 @@ fn execute_node(
         ));
     }
     match node.operation() {
+        Operation::ComfyPack(pack) => {
+            execute_comfy_pack(pack, node, inputs, input_facts, cancellation)
+        }
         Operation::WeightNorm(operation) => {
             execute_weight_norm(*operation, node, inputs, input_facts, cancellation)
         }
@@ -2623,6 +2634,7 @@ fn index_as_u32(index: usize, description: &'static str) -> Result<u32> {
 
 fn infer_outputs(operation: &Operation, inputs: &[&TensorFacts]) -> Result<Box<[TensorFacts]>> {
     match operation {
+        Operation::ComfyPack(pack) => infer_comfy_pack(pack, inputs),
         Operation::Concat(concat) => infer_concat(*concat, inputs),
         Operation::WeightNorm(operation) => infer_weight_norm(*operation, inputs),
         Operation::Permute(permute) => infer_permute(permute, one_input(inputs)?),
