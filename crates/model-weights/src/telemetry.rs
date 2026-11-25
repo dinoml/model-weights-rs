@@ -435,7 +435,7 @@ impl ExecutionReport {
     }
 
     /// Iterates over phases that recorded nonzero or explicitly measured time.
-    #[must_use]
+    #[must_use = "the iterator must be consumed to inspect phase durations"]
     pub fn phase_durations(
         &self,
     ) -> impl ExactSizeIterator<Item = (ExecutionPhase, Duration)> + '_ {

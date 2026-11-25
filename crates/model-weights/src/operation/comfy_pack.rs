@@ -225,12 +225,12 @@ fn validate_components(pack: &ComfyPack, facts: &[&TensorFacts]) -> Result<()> {
             "Comfy weight dtype or physical shape contradicts its format",
         ));
     }
-    if let Some(input) = get(ComfyRole::InputScale)
-        && (!is_float(input) || input.element_count() != 1)
-    {
-        return Err(Error::invalid(
-            "calibrated input scale must be a floating scalar",
-        ));
+    if let Some(input) = get(ComfyRole::InputScale) {
+        if !is_float(input) || input.element_count() != 1 {
+            return Err(Error::invalid(
+                "calibrated input scale must be a floating scalar",
+            ));
+        }
     }
     match pack.config.format {
         ComfyFormat::Float8E4m3fn

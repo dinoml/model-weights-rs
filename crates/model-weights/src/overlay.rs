@@ -93,7 +93,7 @@ impl AliasTable {
     }
 
     /// Returns aliases in deterministic exact-name order.
-    #[must_use]
+    #[must_use = "the iterator must be consumed to inspect aliases"]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&TensorName, &TensorName)> {
         self.entries.iter()
     }
