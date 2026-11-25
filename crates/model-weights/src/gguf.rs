@@ -213,11 +213,15 @@ pub enum GgmlType {
     Q1_0,
     /// GGML `Q2_0` blocks.
     Q2_0,
+    /// Prism two-bit slots with one FP16 scale per 128 values.
+    Pq2_0,
+    /// Prism base-three trits with one FP16 scale per 128 values.
+    Ptq1_0,
 }
 
 impl GgmlType {
     /// Every currently defined, file-valid GGML storage type in code order.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 37] = [
         Self::F32,
         Self::F16,
         Self::Q4_0,
@@ -253,6 +257,8 @@ impl GgmlType {
         Self::Nvfp4,
         Self::Q1_0,
         Self::Q2_0,
+        Self::Pq2_0,
+        Self::Ptq1_0,
     ];
 
     /// Parses one live GGML type code from a GGUF tensor descriptor.
@@ -297,6 +303,8 @@ impl GgmlType {
             40 => Ok(Self::Nvfp4),
             41 => Ok(Self::Q1_0),
             42 => Ok(Self::Q2_0),
+            142 => Ok(Self::Pq2_0),
+            143 => Ok(Self::Ptq1_0),
             _ => Err(Error::unsupported(
                 "GGUF tensor uses a removed, reserved, or unknown GGML storage type",
             )),
@@ -342,6 +350,8 @@ impl GgmlType {
             Self::Nvfp4 => 40,
             Self::Q1_0 => 41,
             Self::Q2_0 => 42,
+            Self::Pq2_0 => 142,
+            Self::Ptq1_0 => 143,
         }
     }
 
@@ -384,6 +394,8 @@ impl GgmlType {
             Self::Nvfp4 => "nvfp4",
             Self::Q1_0 => "q1_0",
             Self::Q2_0 => "q2_0",
+            Self::Pq2_0 => "pq2_0",
+            Self::Ptq1_0 => "ptq1_0",
         }
     }
 
@@ -408,7 +420,7 @@ impl GgmlType {
             | Self::Iq4Nl
             | Self::Mxfp4 => 32,
             Self::Nvfp4 | Self::Q2_0 => 64,
-            Self::Q1_0 => 128,
+            Self::Q1_0 | Self::Pq2_0 | Self::Ptq1_0 => 128,
             Self::Q2K
             | Self::Q3K
             | Self::Q4K
@@ -440,7 +452,8 @@ impl GgmlType {
             Self::Q4_1 => 20,
             Self::Q5_0 => 22,
             Self::Q5_1 => 24,
-            Self::Q8_0 => 34,
+            Self::Q8_0 | Self::Pq2_0 => 34,
+            Self::Ptq1_0 => 28,
             Self::Q8_1 | Self::Nvfp4 => 36,
             Self::Q2K => 84,
             Self::Q3K | Self::Iq3S => 110,
@@ -1106,7 +1119,7 @@ mod tests {
         dtype: Option<DType>,
     }
 
-    const CATALOG: [CatalogEntry; 35] = [
+    const CATALOG: [CatalogEntry; 37] = [
         CatalogEntry {
             code: 0,
             name: "f32",
@@ -1350,6 +1363,20 @@ mod tests {
             name: "q2_0",
             values: 64,
             bytes: 18,
+            dtype: None,
+        },
+        CatalogEntry {
+            code: 142,
+            name: "pq2_0",
+            values: 128,
+            bytes: 34,
+            dtype: None,
+        },
+        CatalogEntry {
+            code: 143,
+            name: "ptq1_0",
+            values: 128,
+            bytes: 28,
             dtype: None,
         },
     ];
