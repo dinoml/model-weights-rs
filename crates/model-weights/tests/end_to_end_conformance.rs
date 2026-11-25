@@ -104,7 +104,7 @@ fn selected_plan_runs_cold_and_warm_through_cache_prepare_and_pipeline()
     assert_report_is_bounded(&cold.report);
 
     let warm = execute_pass(&checkpoint, &forward, &cache, &compatibility, &engine)?;
-    assert!(warm.source_reads.is_empty());
+    assert_eq!(warm.source_reads, [] as [TensorName; 0]);
     assert_delivery(&warm, true);
     assert_phase(&warm.events, ExecutionPhase::CacheLookup);
     assert!(

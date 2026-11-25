@@ -235,7 +235,7 @@ impl Inventory {
     }
 
     /// Iterates over tensors in deterministic name order.
-    #[must_use]
+    #[must_use = "the iterator must be consumed to inspect tensors"]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &TensorRecord> {
         self.tensors.iter()
     }
@@ -329,7 +329,7 @@ impl ShardIndex {
     }
 
     /// Returns mappings in deterministic tensor-name order.
-    #[must_use]
+    #[must_use = "the iterator must be consumed to inspect mappings"]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &RepoPath)> {
         self.weight_map
             .iter()

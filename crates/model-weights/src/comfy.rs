@@ -104,11 +104,11 @@ impl ComfyConfig {
     /// # Errors
     /// Rejects invalid or unsupported quantization metadata.
     pub fn from_metadata(mut value: serde_json::Value) -> Result<Self> {
-        if let Some(object) = value.as_object_mut()
-            && let Some(serde_json::Value::Object(params)) = object.remove("params")
-        {
-            for (name, parameter) in params {
-                object.entry(name).or_insert(parameter);
+        if let Some(object) = value.as_object_mut() {
+            if let Some(serde_json::Value::Object(params)) = object.remove("params") {
+                for (name, parameter) in params {
+                    object.entry(name).or_insert(parameter);
+                }
             }
         }
         if value.get("format").is_none()
@@ -255,24 +255,24 @@ impl Checkpoint {
                 break;
             }
         }
-        if config.is_none()
-            && let Some(record) = self.inventory().tensor(&marker)
-        {
-            if record.storage().logical_dtype() != Some(DType::U8)
-                || record.storage().span().len() > 65_536
-            {
-                return Err(Error::invalid(
-                    "Comfy marker must be a bounded uint8 JSON tensor",
-                ));
+        if config.is_none() {
+            if let Some(record) = self.inventory().tensor(&marker) {
+                if record.storage().logical_dtype() != Some(DType::U8)
+                    || record.storage().span().len() > 65_536
+                {
+                    return Err(Error::invalid(
+                        "Comfy marker must be a bounded uint8 JSON tensor",
+                    ));
+                }
+                config = Some(ComfyConfig::from_json(
+                    self.tensor(&marker)?.bytes().as_slice(),
+                )?);
             }
-            config = Some(ComfyConfig::from_json(
-                self.tensor(&marker)?.bytes().as_slice(),
-            )?);
         }
-        if config.is_none()
-            && let Some(value) = self.comfy_layer_metadata(prefix.trim_end_matches('.'))
-        {
-            config = Some(ComfyConfig::from_metadata(value.clone())?);
+        if config.is_none() {
+            if let Some(value) = self.comfy_layer_metadata(prefix.trim_end_matches('.')) {
+                config = Some(ComfyConfig::from_metadata(value.clone())?);
+            }
         }
         let mut legacy = false;
         if config.is_none()
@@ -373,15 +373,16 @@ impl Checkpoint {
                 suffix
             };
             let source = format!("{prefix}{suffix}");
-            if legacy
-                && role == ComfyRole::InputScale
-                && let Some(record) = self.inventory().tensor(&source)
-                && record.storage().logical_dtype() == Some(DType::F32)
-                && record.storage().span().len() == 4
-            {
-                let value = self.tensor(&source)?;
-                if value.bytes().as_slice() == 1.0f32.to_le_bytes() {
-                    continue;
+            if legacy && role == ComfyRole::InputScale {
+                if let Some(record) = self.inventory().tensor(&source) {
+                    if record.storage().logical_dtype() == Some(DType::F32)
+                        && record.storage().span().len() == 4
+                    {
+                        let value = self.tensor(&source)?;
+                        if value.bytes().as_slice() == 1.0f32.to_le_bytes() {
+                            continue;
+                        }
+                    }
                 }
             }
             if self.inventory().tensor(&source).is_some() {

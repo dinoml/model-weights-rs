@@ -230,7 +230,7 @@ fn empty_tensors_and_multiple_tensors_in_one_shard_are_supported() -> Result<()>
 
     assert_eq!(checkpoint.inventory().files().len(), 1);
     assert_eq!(checkpoint.tensor("empty")?.shape(), [0, 7]);
-    assert!(checkpoint.tensor("empty")?.bytes().as_slice().is_empty());
+    assert_eq!(checkpoint.tensor("empty")?.bytes().as_slice(), &[] as &[u8]);
     assert_eq!(checkpoint.tensor("value")?.bytes().as_slice(), [0x5a]);
     Ok(())
 }
