@@ -861,12 +861,11 @@ fn cast_float_bytes_owned(
 ) -> Result<Box<[u8]>> {
     let (source_width, _target_width, elements) =
         validate_float_cast(source_dtype, source, target_dtype, output_len)?;
-    if target_dtype == DType::Bf16 {
-        if let Some(output) =
+    if target_dtype == DType::Bf16
+        && let Some(output) =
             crate::prepare_simd::cast_to_bf16(source_dtype, source, output_len, cancellation)?
-        {
-            return Ok(output);
-        }
+    {
+        return Ok(output);
     }
     match (source_dtype, target_dtype) {
         (DType::U8, DType::F32) => collect_cast_blocks(
@@ -1006,7 +1005,7 @@ fn validate_float_cast(
 ) -> Result<(usize, usize, usize)> {
     let source_width = float_width(source_dtype)?;
     let target_width = float_width(target_dtype)?;
-    if source.len() % source_width != 0 {
+    if !source.len().is_multiple_of(source_width) {
         return Err(Error::integrity(
             "source byte length is not a whole number of float elements",
         ));

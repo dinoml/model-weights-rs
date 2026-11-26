@@ -215,8 +215,8 @@ fn validate_components(pack: &ComfyPack, facts: &[&TensorFacts]) -> Result<()> {
         ComfyFormat::SvdquantW4a4 => {
             dtype == DType::I8
                 && (weight.logical_shape() == packed
-                    || (pack.rows % 128 == 0
-                        && pack.columns % 64 == 0
+                    || (pack.rows.is_multiple_of(128)
+                        && pack.columns.is_multiple_of(64)
                         && weight.logical_shape() == [pack.rows / 128, pack.columns / 64, 32, 128]))
         }
     };
@@ -356,7 +356,7 @@ fn layout(pack: &ComfyPack, facts: &[&TensorFacts]) -> Result<([u64; HEADER_WORD
         || pack.config.group_size == 0
         || (pack.config.convrot
             && (pack.config.convrot_groupsize == 0
-                || pack.columns % pack.config.convrot_groupsize != 0))
+                || !pack.columns.is_multiple_of(pack.config.convrot_groupsize)))
         || pack.roles[0] != ComfyRole::Weight
         || pack
             .roles
@@ -447,14 +447,14 @@ fn layout(pack: &ComfyPack, facts: &[&TensorFacts]) -> Result<([u64; HEADER_WORD
                 "FP8/INT8 scales must be scalar or per output row",
             ));
         }
-        ComfyFormat::Mxfp8 if pack.columns % 32 != 0 => {
+        ComfyFormat::Mxfp8 if !pack.columns.is_multiple_of(32) => {
             return Err(Error::invalid("MXFP8 K must divide into blocks of 32"));
         }
-        ComfyFormat::Nvfp4 if pack.columns % 16 != 0 => {
+        ComfyFormat::Nvfp4 if !pack.columns.is_multiple_of(16) => {
             return Err(Error::invalid("NVFP4 K must divide into blocks of 16"));
         }
         ComfyFormat::AwqW4a16 | ComfyFormat::SvdquantW4a4
-            if pack.columns % pack.config.group_size != 0 =>
+            if !pack.columns.is_multiple_of(pack.config.group_size) =>
         {
             return Err(Error::invalid("INT4 K must divide into scale groups"));
         }

@@ -11,7 +11,7 @@ const DEFAULT_MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_WORK_ITEMS: usize = 1_000_000;
 const DEFAULT_DELIVERY_QUEUE_DEPTH: usize = 2;
 
-/// Limits applied while parsing checkpoint and index metadata.
+/// Limits for checkpoint metadata and on-demand format normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(
     clippy::struct_field_names,
@@ -24,6 +24,8 @@ pub struct ResourceLimits {
     max_rank: usize,
     max_name_bytes: usize,
     max_metadata_bytes: usize,
+    max_zip_member_bytes: u64,
+    max_pytorch_read_bytes: u64,
 }
 
 impl ResourceLimits {
@@ -62,10 +64,21 @@ impl ResourceLimits {
         self.max_name_bytes
     }
 
-    /// Returns the maximum opaque quantization metadata bytes accepted.
+    /// Returns the maximum budget for materialized checkpoint metadata.
     #[must_use]
     pub const fn max_metadata_bytes(&self) -> usize {
         self.max_metadata_bytes
+    }
+    /// Returns the maximum expanded byte length of a DEFLATE tensor member.
+    #[must_use]
+    pub const fn max_zip_member_bytes(&self) -> u64 {
+        self.max_zip_member_bytes
+    }
+
+    /// Returns the maximum output bytes requested from one normalized `PyTorch` span.
+    #[must_use]
+    pub const fn max_pytorch_read_bytes(&self) -> u64 {
+        self.max_pytorch_read_bytes
     }
 }
 
@@ -78,6 +91,8 @@ impl Default for ResourceLimits {
             max_rank: DEFAULT_MAX_RANK,
             max_name_bytes: DEFAULT_MAX_NAME_BYTES,
             max_metadata_bytes: DEFAULT_MAX_METADATA_BYTES,
+            max_zip_member_bytes: 2 * 1024 * 1024 * 1024,
+            max_pytorch_read_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -120,9 +135,21 @@ impl ResourceLimitsBuilder {
         self
     }
 
-    /// Sets the maximum opaque quantization metadata length.
+    /// Sets the maximum budget for materialized checkpoint metadata.
     pub const fn max_metadata_bytes(mut self, value: usize) -> Self {
         self.limits.max_metadata_bytes = value;
+        self
+    }
+
+    /// Sets the maximum expanded byte length of a DEFLATE tensor member.
+    pub const fn max_zip_member_bytes(mut self, value: u64) -> Self {
+        self.limits.max_zip_member_bytes = value;
+        self
+    }
+
+    /// Sets the maximum output bytes requested from one normalized `PyTorch` span.
+    pub const fn max_pytorch_read_bytes(mut self, value: u64) -> Self {
+        self.limits.max_pytorch_read_bytes = value;
         self
     }
 
@@ -138,7 +165,9 @@ impl ResourceLimitsBuilder {
             && limits.max_shards > 0
             && limits.max_rank > 0
             && limits.max_name_bytes > 0
-            && limits.max_metadata_bytes > 0;
+            && limits.max_metadata_bytes > 0
+            && limits.max_zip_member_bytes > 0
+            && limits.max_pytorch_read_bytes > 0;
         if !all_nonzero {
             return Err(Error::limit(
                 "resource limits must all be greater than zero",

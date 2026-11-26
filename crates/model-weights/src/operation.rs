@@ -2591,7 +2591,7 @@ fn checked_offset_term(offset: u64, coordinate: u64, stride: u64) -> Result<u64>
 }
 
 fn check_copy_cancellation(element: u64, cancellation: &CancellationToken) -> Result<()> {
-    if element % COPY_TILE_ELEMENTS == 0 {
+    if element.is_multiple_of(COPY_TILE_ELEMENTS) {
         cancellation.check()?;
     }
     Ok(())
@@ -2599,7 +2599,7 @@ fn check_copy_cancellation(element: u64, cancellation: &CancellationToken) -> Re
 
 fn dtype_width(dtype: DType) -> Result<usize> {
     let bits = dtype.bits();
-    if bits == 0 || bits % 8 != 0 {
+    if bits == 0 || !bits.is_multiple_of(8) {
         return Err(Error::unsupported(
             "host structural operations require byte-aligned scalar dtypes",
         ));

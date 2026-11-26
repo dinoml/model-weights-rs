@@ -22,9 +22,9 @@ pub(crate) fn cast_to_bf16(
         && std::arch::is_x86_feature_detected!("f16c")
     {
         let width = if dtype == DType::F16 { 2 } else { 4 };
-        if source.len() % width != 0
+        if !source.len().is_multiple_of(width)
             || output_len / 2 != source.len() / width
-            || output_len % 2 != 0
+            || !output_len.is_multiple_of(2)
         {
             return Err(Error::integrity("BF16 conversion buffer length mismatch"));
         }

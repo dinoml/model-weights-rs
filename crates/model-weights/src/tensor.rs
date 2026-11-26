@@ -111,12 +111,14 @@ impl FileId {
     }
 }
 
-/// A validated absolute byte span within an opened source file.
+/// A byte span within an opened source file or a checkpoint-owned tensor view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct SourceSpan {
     file: FileId,
     offset: u64,
     length: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    view: Option<u32>,
 }
 
 impl SourceSpan {
@@ -133,6 +135,7 @@ impl SourceSpan {
             file,
             offset,
             length,
+            view: None,
         })
     }
 
@@ -142,10 +145,33 @@ impl SourceSpan {
         self.file
     }
 
-    /// Returns the absolute file offset.
+    /// Returns the offset in the file or in the logical byte stream of a tensor view.
     #[must_use]
     pub const fn offset(self) -> u64 {
         self.offset
+    }
+
+    /// Identifies a checkpoint-owned tensor view when this span reads normalized bytes.
+    #[must_use]
+    pub const fn tensor_view(self) -> Option<u32> {
+        self.view
+    }
+
+    pub(crate) fn for_tensor_view(file: FileId, view: u32, length: u64) -> Result<Self> {
+        Ok(Self {
+            view: Some(view),
+            ..Self::new(file, 0, length)?
+        })
+    }
+
+    pub(crate) fn subspan(self, offset: u64, length: u64) -> Result<Self> {
+        if offset > self.length || length > self.length - offset {
+            return Err(Error::invalid("source subspan extends beyond its parent"));
+        }
+        Ok(Self {
+            view: self.view,
+            ..Self::new(self.file, self.offset + offset, length)?
+        })
     }
 
     /// Returns the span length.
@@ -174,13 +200,18 @@ struct SourceSpanWire {
     file: FileId,
     offset: u64,
     length: u64,
+    #[serde(default)]
+    view: Option<u32>,
 }
 
 impl TryFrom<SourceSpanWire> for SourceSpan {
     type Error = Error;
 
     fn try_from(wire: SourceSpanWire) -> Result<Self> {
-        Self::new(wire.file, wire.offset, wire.length)
+        Ok(Self {
+            view: wire.view,
+            ..Self::new(wire.file, wire.offset, wire.length)?
+        })
     }
 }
 

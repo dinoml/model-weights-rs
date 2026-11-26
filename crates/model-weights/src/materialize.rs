@@ -1550,12 +1550,14 @@ impl<'a> Materializer<'a> {
 
     fn source_span_is_guaranteed_mapped(&self, span: SourceSpan) -> Result<bool> {
         Ok(cfg!(feature = "mmap")
+            && span.tensor_view().is_none()
             && self.source_kind(span)? == SourceKind::RetainedSnapshot
             && self.checkpoint.access_mode() == AccessMode::Mmap)
     }
 
     fn source_span_uses_mapping(&self, span: SourceSpan) -> Result<bool> {
         Ok(cfg!(feature = "mmap")
+            && span.tensor_view().is_none()
             && self.source_kind(span)? == SourceKind::RetainedSnapshot
             && matches!(
                 self.checkpoint.access_mode(),

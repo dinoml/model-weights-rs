@@ -417,7 +417,7 @@ impl SourceTensor {
         &self.storage
     }
 
-    /// Create a named, zero-copy view of complete contiguous matrix rows.
+    /// Create a named view of complete matrix rows.
     ///
     /// # Errors
     /// Rejects invalid matrix ranges, unsupported packed layouts and overflow.
@@ -431,14 +431,13 @@ impl SourceTensor {
                 let row_bytes = dtype.byte_len(&self.shape[1..])?;
                 let offset = start
                     .checked_mul(row_bytes)
-                    .and_then(|value| span.offset().checked_add(value))
                     .ok_or_else(|| Error::limit("row slice offset overflows"))?;
                 let length = (end - start)
                     .checked_mul(row_bytes)
                     .ok_or_else(|| Error::limit("row slice extent overflows"))?;
                 Storage::Plain {
                     dtype: *dtype,
-                    span: crate::tensor::SourceSpan::new(span.file(), offset, length)?,
+                    span: span.subspan(offset, length)?,
                 }
             }
             Storage::Quantized(storage) => Storage::Quantized(storage.slice_rows(start, end)?),

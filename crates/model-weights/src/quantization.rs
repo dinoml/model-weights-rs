@@ -443,7 +443,7 @@ impl QuantizedStorage {
         };
         let width = self.logical_shape[1];
         if !matches!(blocks.order(), PackingOrder::Flat | PackingOrder::Axis(1))
-            || width % u64::from(blocks.values_per_block()) != 0
+            || !width.is_multiple_of(u64::from(blocks.values_per_block()))
         {
             return Err(Error::unsupported(
                 "quantized blocks must fit complete matrix rows",

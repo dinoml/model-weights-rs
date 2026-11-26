@@ -852,7 +852,7 @@ fn storage(file_id: FileId, offset: u64, shape: &[u64], ggml_type_code: u32) -> 
         .ok_or_else(|| Error::invalid("packed GGUF tensor has no block axis"))?;
     let values_per_block = ggml_type.values_per_block();
     let bytes_per_block = ggml_type.bytes_per_block();
-    if shape[axis] % u64::from(values_per_block) != 0 {
+    if !shape[axis].is_multiple_of(u64::from(values_per_block)) {
         return Err(Error::invalid(
             "packed GGUF tensor row length is not a whole storage block",
         ));

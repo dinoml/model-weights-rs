@@ -46,6 +46,8 @@ pub struct FileRecord {
     size: u64,
     kind: SourceKind,
     digest: DigestState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tensor_view_lengths: Vec<u64>,
 }
 
 impl FileRecord {
@@ -62,7 +64,13 @@ impl FileRecord {
             size,
             kind,
             digest,
+            tensor_view_lengths: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_tensor_view_lengths(mut self, lengths: Vec<u64>) -> Self {
+        self.tensor_view_lengths = lengths;
+        self
     }
 
     /// Returns the inventory-local file identifier.
@@ -261,7 +269,17 @@ fn validate_inventory_span(span: crate::tensor::SourceSpan, files: &[FileRecord]
     let file = files
         .get(file_index)
         .ok_or_else(|| Error::invalid("inventory storage refers to an unknown source file"))?;
-    if span.end() > file.size {
+    let size = match span.tensor_view() {
+        Some(id) => *file
+            .tensor_view_lengths
+            .get(
+                usize::try_from(id)
+                    .map_err(|_error| Error::limit("tensor view ID does not fit usize"))?,
+            )
+            .ok_or_else(|| Error::invalid("inventory storage refers to an unknown tensor view"))?,
+        None => file.size,
+    };
+    if span.end() > size {
         return Err(Error::invalid(
             "inventory storage span extends beyond its source file",
         ));

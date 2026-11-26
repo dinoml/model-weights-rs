@@ -131,7 +131,7 @@ impl ComfyConfig {
             && (self.weight_rotated == Some(false)
                 || self.convrot_groupsize < 4
                 || !self.convrot_groupsize.is_power_of_two()
-                || self.convrot_groupsize.trailing_zeros() % 2 != 0)
+                || !self.convrot_groupsize.trailing_zeros().is_multiple_of(2))
         {
             return Err(Error::invalid("ConvRot group size must be a power of four"));
         }

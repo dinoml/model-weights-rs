@@ -1,4 +1,4 @@
-//! Safe checkpoint opening, bounded Safetensors and GGUF parsing, and byte access.
+//! Safe checkpoint opening, bounded metadata parsing, and byte access.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -51,6 +51,8 @@ pub enum CheckpointFormat {
     Safetensors,
     /// One or more GGUF files.
     Gguf,
+    /// One or more `PyTorch` weight files.
+    PyTorch,
 }
 
 /// Immutable bytes and metadata for one plain tensor.
@@ -172,6 +174,8 @@ pub struct Checkpoint {
 struct CheckpointInner {
     inventory: Inventory,
     files: Box<[Arc<OpenFile>]>,
+    tensor_views: Box<[Vec<crate::pytorch::TensorView>]>,
+    max_pytorch_read_bytes: u64,
     access: AccessMode,
     format: CheckpointFormat,
     gguf_metadata: Box<[GgufMetadata]>,
@@ -180,7 +184,7 @@ struct CheckpointInner {
 }
 
 impl Checkpoint {
-    /// Opens one Safetensors or GGUF file, or a local shard index.
+    /// Opens one Safetensors, GGUF, or `PyTorch` file, or a local shard index.
     ///
     /// # Errors
     ///
@@ -190,7 +194,7 @@ impl Checkpoint {
         Self::open_with_cancellation(path, &CancellationToken::new())
     }
 
-    /// Opens one Safetensors or GGUF file, or a local index, with cancellation.
+    /// Opens one checkpoint file or local shard index with cancellation.
     ///
     /// # Errors
     ///
@@ -364,6 +368,7 @@ impl Checkpoint {
     }
 
     /// Materializes the bytes covered by a previously validated source span.
+    /// Strided and big-endian tensor views are normalized when read.
     ///
     /// This low-level method is intended for plan and preparation providers.
     ///
@@ -394,7 +399,26 @@ impl Checkpoint {
             .files
             .get(file_index)
             .ok_or_else(|| Error::invalid("source span refers to an unknown file"))?;
-        let view = file.read_span(span, self.inner.access, cancellation)?;
+        let view = if let Some(id) = span.tensor_view() {
+            if span.len() > self.inner.max_pytorch_read_bytes {
+                return Err(Error::limit(
+                    "normalized PyTorch span exceeds its read limit",
+                ));
+            }
+            let id = usize::try_from(id)
+                .map_err(|_error| Error::limit("tensor view ID does not fit usize"))?;
+            let view = self.inner.tensor_views[file_index].get(id).ok_or_else(|| {
+                Error::invalid("checkpoint span refers to an unknown tensor view")
+            })?;
+            if self.inner.access == AccessMode::Mmap {
+                return Err(Error::unsupported(
+                    "normalized tensor views require owned reads",
+                ));
+            }
+            view.read(&file.file, span, cancellation)?
+        } else {
+            file.read_span(span, self.inner.access, cancellation)?
+        };
         cancellation.check()?;
         Ok(view)
     }
@@ -665,6 +689,7 @@ impl CheckpointBuilder {
         let mut open_files = Vec::with_capacity(self.sources.len());
         let mut file_records = Vec::with_capacity(self.sources.len());
         let mut tensor_records = Vec::new();
+        let mut tensor_views = Vec::new();
         let mut format = None;
         let mut gguf_metadata = Vec::new();
         let mut comfy_metadata = BTreeMap::new();
@@ -676,9 +701,7 @@ impl CheckpointBuilder {
             let file = Arc::new(OpenFile::open(source, id)?);
             let parsed = file.parse_source(&self.limits, cancellation)?;
             if format.is_some_and(|current| current != parsed.format) {
-                return Err(Error::invalid(
-                    "checkpoint cannot mix Safetensors and GGUF sources",
-                ));
+                return Err(Error::invalid("checkpoint cannot mix weight formats"));
             }
             format = Some(parsed.format);
             if let Some(metadata) = parsed.gguf_metadata {
@@ -698,7 +721,8 @@ impl CheckpointBuilder {
                 ));
             }
             tensor_records.extend(parsed.tensors);
-            file_records.push(file.record());
+            file_records.push(file.record(&parsed.tensor_views));
+            tensor_views.push(parsed.tensor_views);
             open_files.push(file);
         }
         cancellation.check()?;
@@ -706,7 +730,7 @@ impl CheckpointBuilder {
         if let Some(index) = &self.shard_index {
             if format == Some(CheckpointFormat::Gguf) {
                 return Err(Error::invalid(
-                    "a Safetensors shard index cannot describe a GGUF checkpoint",
+                    "a weight_map shard index cannot describe a GGUF checkpoint",
                 ));
             }
             validate_shard_index(index, &inventory, cancellation)?;
@@ -717,6 +741,8 @@ impl CheckpointBuilder {
             inner: Arc::new(CheckpointInner {
                 inventory,
                 files: open_files.into_boxed_slice(),
+                tensor_views: tensor_views.into_boxed_slice(),
+                max_pytorch_read_bytes: self.limits.max_pytorch_read_bytes(),
                 access: self.access,
                 format: format.unwrap_or(CheckpointFormat::Safetensors),
                 gguf_metadata: gguf_metadata.into_boxed_slice(),
@@ -744,6 +770,7 @@ struct ParsedSource {
     gguf_metadata: Option<GgufMetadata>,
     quantization_metadata: Option<Box<str>>,
     tensors: Vec<TensorRecord>,
+    tensor_views: Vec<crate::pytorch::TensorView>,
 }
 
 impl Debug for OpenFile {
@@ -789,7 +816,7 @@ impl OpenFile {
         })
     }
 
-    fn record(&self) -> FileRecord {
+    fn record(&self, views: &[crate::pytorch::TensorView]) -> FileRecord {
         FileRecord::new(
             self.id,
             self.source.logical_path().clone(),
@@ -797,6 +824,7 @@ impl OpenFile {
             self.source.kind(),
             DigestState::from(self.source.digest_policy()),
         )
+        .with_tensor_view_lengths(views.iter().map(crate::pytorch::TensorView::len).collect())
     }
 
     fn parse_source(
@@ -826,10 +854,28 @@ impl OpenFile {
                 gguf_metadata: Some(metadata),
                 quantization_metadata: None,
                 tensors,
+                tensor_views: Vec::new(),
             });
         }
         if gguf_extension {
             return Err(Error::invalid("GGUF source has invalid magic"));
+        }
+        if let Some(container) = crate::pytorch::detect(&self.file, self.size, magic)? {
+            let (tensors, tensor_views) = crate::pytorch::parse(
+                &self.file,
+                self.size,
+                self.id,
+                container,
+                limits,
+                cancellation,
+            )?;
+            return Ok(ParsedSource {
+                format: CheckpointFormat::PyTorch,
+                gguf_metadata: None,
+                quantization_metadata: None,
+                tensors,
+                tensor_views,
+            });
         }
         self.parse_safetensors_header(limits, cancellation)
     }
@@ -896,6 +942,7 @@ impl OpenFile {
             gguf_metadata: None,
             quantization_metadata,
             tensors,
+            tensor_views: Vec::new(),
         })
     }
 
@@ -1088,12 +1135,12 @@ impl OpenFile {
             ));
         }
         let digest = ContentDigest::from_bytes(hasher.finalize().into());
-        if let DigestPolicy::VerifyOnDemand(expected) = self.source.digest_policy() {
-            if digest != expected {
-                return Err(Error::integrity(
-                    "checkpoint source digest differs from its declared digest",
-                ));
-            }
+        if let DigestPolicy::VerifyOnDemand(expected) = self.source.digest_policy()
+            && digest != expected
+        {
+            return Err(Error::integrity(
+                "checkpoint source digest differs from its declared digest",
+            ));
         }
         *cached = Some(digest);
         Ok(digest)

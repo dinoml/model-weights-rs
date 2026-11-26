@@ -20,15 +20,17 @@ test-util = []
 
 [dependencies]
 crossbeam-channel.workspace = true
+crc32fast = "1"
+flate2 = "1"
 half.workspace = true
 memmap2 = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

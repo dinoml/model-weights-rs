@@ -24,7 +24,7 @@ fn write_safetensors(
     payload: &[u8],
 ) -> Result<std::path::PathBuf> {
     let mut header = header_json.as_bytes().to_vec();
-    while header.len() % 8 != 0 {
+    while !header.len().is_multiple_of(8) {
         header.push(b' ');
     }
     let path = directory.path().join(name);

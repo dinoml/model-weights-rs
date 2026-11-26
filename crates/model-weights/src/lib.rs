@@ -15,6 +15,7 @@
 mod cancel;
 mod checkpoint;
 mod error;
+mod pytorch;
 
 pub mod cache;
 pub mod comfy;
@@ -23,6 +24,7 @@ pub mod identity;
 pub mod inventory;
 pub mod limits;
 pub mod materialize;
+pub mod metadata;
 pub mod operation;
 mod operation_simd;
 pub mod overlay;

@@ -86,14 +86,49 @@ turns the checked SD1.5 adapter into a staged runtime migration. The
 [benchmark protocol](docs/benchmarking.md) defines the Stable Diffusion 1.5
 regression comparison.
 
+## PyTorch weights
+
+`Checkpoint` recognizes modern PyTorch ZIP/ZIP64 archives, legacy pickle
+streams, and historical PyTorch tar checkpoints by content. Hugging Face
+`pytorch_model.bin.index.json` can use the same `weight_map` entry point as
+Safetensors. A checkpoint can contain a flat state dictionary, a
+`state_dict` wrapper, a single unambiguous nested weight dictionary, a
+standalone tensor (named `tensor`), or a sequence of tensors (named by
+their zero-based positions). Bare storages are exposed as one-dimensional
+tensors. Quantized linear weight/bias pairs stored under `_packed_params`
+are exposed with `.0` and `.1` suffixes.
+
+The first-party parser interprets pickle as data and observes resource limits
+and cancellation. ZIP members may be stored or DEFLATE-compressed. Compressed
+metadata is expanded within the header budget. Compressed storage members are
+expanded on demand into temporary files, with length and CRC validation and a
+configurable expanded-size limit per member.
+
+Contiguous little-endian tensors in stored members use direct byte spans.
+Strided and big-endian tensors produce row-major little-endian bytes on
+demand. Sparse COO, CSR, CSC, BSR and BSC tensors are delivered as dense bytes
+in their original value dtype. PyTorch affine quantized tensors are delivered
+as dequantized FP32 bytes. A configurable per-read limit bounds normalized
+output. These views use owned reads and are unavailable with forced
+`AccessMode::Mmap`.
+
+Use `metadata::read_pytorch_field` for a named top-level field such as
+`ckpt_config`. It returns a bounded JSON-compatible value without loading
+tensor storage. `metadata::read_pytorch_field_from_reader` accepts a seekable
+source, including a caller-supplied range reader. Model-specific schema
+validation belongs to the consumer.
+
+TorchScript and Python model reconstruction are outside the weight reader's
+supported subset.
+
 ## Safety and compatibility
 
-- Rust 1.85 or newer, edition 2024.
+- Rust 1.95 or newer, edition 2024.
 - Apache-2.0 licensed.
 - No payload hashing during header-only inventory.
 - A path ending in `.gguf` must contain GGUF magic and never falls back to
   Safetensors parsing.
-- No implicit quantized decode or dtype conversion.
+- Packed GGUF decoding and target dtype conversions use explicit preparation routes.
 - Operation-graph input order is semantic and participates in plan and cache
   identity.
 - Tensor dtype, rank, logical and storage geometry, layout, byte length, and
