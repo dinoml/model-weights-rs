@@ -422,13 +422,13 @@ impl QuantizedStorage {
     /// Describe complete matrix rows without decoding or copying their blocks.
     ///
     /// # Errors
-    /// Rejects invalid ranges, opaque or cross-row packing, companion/grouped
+    /// Rejects invalid ranges, opaque or cross-row packing, companion/row-grouped
     /// layouts, and overflowing byte extents.
     pub fn slice_rows(&self, start: u64, end: u64) -> Result<Self> {
         if self.logical_shape.len() != 2 || start >= end || end > self.logical_shape[0] {
             return Err(Error::binding("packed row slice exceeds the source matrix"));
         }
-        if self.grouping.is_some()
+        if self.grouping.is_some_and(|group| group.axis() != 1)
             || !self.companions.is_empty()
             || !self.required_companions.is_empty()
         {
@@ -671,6 +671,11 @@ pub enum QuantizedRoute {
         /// The target normalized encoding identity.
         target_encoding: ImplementationId,
     },
+    /// Execute a registered bounded host packer and cache typed packed bytes.
+    HostRepack {
+        /// Normalized encoding identity of the prepared packed output.
+        target_encoding: ImplementationId,
+    },
 }
 
 /// A complete custom layout ABI requirement for a quantized route.
@@ -764,6 +769,11 @@ impl RouteCapability {
         backend: Option<BackendId>,
         target_layout: Option<LayoutRequirement>,
     ) -> Result<Self> {
+        if matches!(route, QuantizedRoute::HostRepack { .. }) && target_layout.is_none() {
+            return Err(Error::unsupported(
+                "host repack requires an exact custom target layout",
+            ));
+        }
         if matches!(
             route,
             QuantizedRoute::PackedDirect

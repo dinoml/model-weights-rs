@@ -20,6 +20,7 @@ use crate::cache::{
 use crate::identity::{ContentDigest, PlanId, StableName};
 use crate::operation::OperationGraph;
 use crate::overlay::{OverlayBinding, OverlayPlan};
+use crate::packed_prepare::{PackedOutputDescriptor, PackedPrepareRequest};
 use crate::pipeline::{
     Pipeline, PrepareContext, PreparedItem, PreparedSink, ResourceWeights, WorkItem,
 };
@@ -37,7 +38,7 @@ use crate::telemetry::{
 use crate::tensor::{ByteView, SourceSpan};
 use crate::{AccessMode, CancellationToken, Checkpoint, Error, ErrorCategory, Result};
 
-const PREPARED_CACHE_FORMAT_VERSION: u32 = 2;
+const PREPARED_CACHE_FORMAT_VERSION: u32 = 3;
 const CACHE_READ_BLOCK_BYTES: usize = 1024 * 1024;
 const MAX_CACHED_PLAN_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -360,6 +361,8 @@ impl OverlayHandoff {
 pub enum WeightDelivery {
     /// Final host bytes ready for a consumer allocation or upload.
     Prepared(Box<PreparedWeight>),
+    /// Final compressed host bytes with a validated numerical/layout descriptor.
+    PreparedQuantized(Box<PreparedQuantizedWeight>),
     /// A provider-owned declarative conversion still to execute.
     Conversion(Box<ConversionHandoff>),
     /// A consumer/provider-owned typed operation graph still to execute.
@@ -376,6 +379,7 @@ impl WeightDelivery {
     pub fn target(&self) -> &TargetTensor {
         match self {
             Self::Prepared(weight) => weight.target(),
+            Self::PreparedQuantized(weight) => weight.target(),
             Self::Conversion(handoff) => handoff.target(),
             Self::Operation(handoff) => handoff.target(),
             Self::Quantized(handoff) => handoff.target(),
@@ -388,6 +392,7 @@ impl WeightDelivery {
     pub fn target_name(&self) -> &TensorName {
         match self {
             Self::Prepared(weight) => weight.target_name(),
+            Self::PreparedQuantized(weight) => weight.target().name(),
             Self::Conversion(handoff) => handoff.target().name(),
             Self::Operation(handoff) => handoff.target().name(),
             Self::Quantized(handoff) => handoff.target().name(),
@@ -400,6 +405,7 @@ impl WeightDelivery {
     pub fn resident_bytes(&self) -> u64 {
         match self {
             Self::Prepared(weight) => weight.resident_bytes(),
+            Self::PreparedQuantized(weight) => weight.resident_bytes(),
             Self::Conversion(handoff) => handoff.resident_bytes(),
             Self::Operation(handoff) => handoff.resident_bytes(),
             Self::Quantized(handoff) => handoff.resident_bytes(),
@@ -833,7 +839,8 @@ impl<'a> Materializer<'a> {
     /// return `None` because they have no finalized host representation to
     /// reuse. Provider-completed conversion recipes and host dequantization
     /// routes are addressable and can be published with
-    /// [`Self::publish_prepared_bytes`].
+    /// [`Self::publish_prepared_bytes`]. Executable `HostRepack` routes also
+    /// have addresses; their typed materialization owns envelope publication.
     ///
     /// # Errors
     ///
@@ -876,8 +883,9 @@ impl<'a> Materializer<'a> {
     ///
     /// This is the cache integration point for lazy overlays, conversion
     /// recipes, and host-dequantization providers. Device-scratch, direct
-    /// packed, fused-in-tile, and repack routes intentionally have no host
-    /// prepared-cache address.
+    /// packed, fused-in-tile, and legacy repack handoffs have no host address.
+    /// Executable `HostRepack` publication belongs to the typed materialization
+    /// route and is rejected here to preserve its descriptor envelope.
     ///
     /// # Errors
     ///
@@ -894,6 +902,17 @@ impl<'a> Materializer<'a> {
         let binding = self.binding(target_name)?;
         let actual = u64::try_from(bytes.len())
             .map_err(|_error| Error::limit("prepared byte length does not fit u64"))?;
+        if binding
+            .target()
+            .quantized_route()
+            .is_some_and(|capability| {
+                matches!(capability.route(), QuantizedRoute::HostRepack { .. })
+            })
+        {
+            return Err(Error::unsupported(
+                "host repack publication is owned by its typed materialization route",
+            ));
+        }
         if actual != binding.target().output_size() {
             return Err(Error::integrity(
                 "provider-produced bytes differ from the planned output size",
@@ -1060,7 +1079,11 @@ impl<'a> Materializer<'a> {
                         .target()
                         .quantized_route()
                         .is_some_and(|capability| {
-                            matches!(capability.route(), QuantizedRoute::HostDequant { .. })
+                            matches!(
+                                capability.route(),
+                                QuantizedRoute::HostDequant { .. }
+                                    | QuantizedRoute::HostRepack { .. }
+                            )
                         })
                 }
             }
@@ -1505,6 +1528,27 @@ impl<'a> Materializer<'a> {
             Storage::Quantized(storage) => self.quantized_source_bytes(storage)?,
         };
         let scratch_bytes = peak_transform_scratch_bytes(binding.target().transforms())?;
+        if let Storage::Quantized(storage) = binding.source().storage()
+            && binding
+                .target()
+                .quantized_route()
+                .is_some_and(|capability| {
+                    matches!(capability.route(), QuantizedRoute::HostRepack { .. })
+                })
+        {
+            let sizes = self.preparation.packed_providers().validate(
+                PackedPrepareRequest {
+                    source: storage,
+                    target: binding.target(),
+                },
+                &CancellationToken::new(),
+            )?;
+            return Ok(ResourceWeights::new(
+                source_bytes,
+                sizes.scratch_bytes,
+                sizes.output_bytes,
+            ));
+        }
         let prepared_bytes = if binding.target().conversion_recipe().is_some()
             || matches!(binding.source().storage(), Storage::Quantized(_))
         {
@@ -1646,7 +1690,8 @@ impl<'a> Materializer<'a> {
         let CacheLookup::Hit(entry) = lookup else {
             return Ok(None);
         };
-        if entry.info().payload_len() != binding.target().output_size() {
+        let cached_bytes = cached_output_size(binding.target())?;
+        if entry.info().payload_len() != cached_bytes {
             let _record = cache.evict(
                 CacheNamespace::Prepared,
                 address.key(),
@@ -1656,7 +1701,7 @@ impl<'a> Materializer<'a> {
             return Ok(None);
         }
 
-        let required = ResourceWeights::new(0, 0, binding.target().output_size());
+        let required = ResourceWeights::new(0, 0, cached_bytes);
         let read = if let Some(pipeline_context) = context.as_deref_mut() {
             pipeline_context.with_resources(required, |pipeline_context| {
                 let mut nested_context = Some(pipeline_context);
@@ -1677,8 +1722,8 @@ impl<'a> Materializer<'a> {
                 |cancellation| read_cache_entry(entry, self.cache_validation, cancellation),
             )
         };
-        match read {
-            Ok(bytes) => prepared_delivery(binding, bytes, PreparedOrigin::Cache).map(Some),
+        match read.and_then(|bytes| prepared_delivery(binding, bytes, PreparedOrigin::Cache)) {
+            Ok(delivery) => Ok(Some(delivery)),
             Err(error) if error.category() == ErrorCategory::Integrity => {
                 let _record = cache.evict(
                     CacheNamespace::Prepared,
@@ -1756,6 +1801,41 @@ impl<'a> Materializer<'a> {
             companions.insert(role.clone(), bytes);
         }
         cancellation.check()?;
+        if matches!(capability.route(), QuantizedRoute::HostRepack { .. }) {
+            let request = PackedPrepareRequest {
+                source: storage,
+                target: binding.target(),
+            };
+            let registry = self.preparation.packed_providers();
+            let sizes = registry.validate(request, cancellation)?;
+            let mut output = crate::packed_prepare::allocate(sizes.output_bytes)?;
+            let mut scratch = crate::packed_prepare::allocate(sizes.scratch_bytes)?;
+            registry.prepare_into(
+                request,
+                &payload,
+                &companions,
+                &mut output,
+                &mut scratch,
+                cancellation,
+            )?;
+            drop(scratch);
+            let bytes = ByteView::from_boxed(output.into_boxed_slice());
+            if let (Some(cache), Some(address)) = (
+                self.cache,
+                self.cache_address_for_binding_with_cancellation(binding, None, cancellation)?,
+            ) {
+                let prefix = PackedOutputDescriptor::from_target(binding.target())?.prefix()?;
+                let reader = prefix.as_slice().chain(bytes.as_slice());
+                let _publication = cache.publish_reader(
+                    CacheNamespace::Prepared,
+                    address.key(),
+                    address.compatibility(),
+                    reader,
+                    cancellation,
+                )?;
+            }
+            return prepared_delivery(binding, bytes, PreparedOrigin::Transform);
+        }
         Ok(WeightDelivery::Quantized(Box::new(QuantizedHandoff {
             source: binding.source().clone(),
             target: binding.target().clone(),
@@ -1774,6 +1854,32 @@ fn prepared_delivery(
     origin: PreparedOrigin,
 ) -> Result<WeightDelivery> {
     let resident_bytes = view_len_u64(&bytes)?;
+    if binding
+        .target()
+        .quantized_route()
+        .is_some_and(|capability| matches!(capability.route(), QuantizedRoute::HostRepack { .. }))
+    {
+        let descriptor = PackedOutputDescriptor::from_target(binding.target())?;
+        let bytes = if origin == PreparedOrigin::Cache {
+            descriptor.unpack_cached(&bytes)?
+        } else {
+            bytes
+        };
+        if view_len_u64(&bytes)? != descriptor.byte_len() {
+            return Err(Error::integrity(
+                "prepared packed bytes differ from the declared output",
+            ));
+        }
+        return Ok(WeightDelivery::PreparedQuantized(Box::new(
+            PreparedQuantizedWeight {
+                target: binding.target().clone(),
+                descriptor,
+                bytes,
+                origin,
+                resident_bytes,
+            },
+        )));
+    }
     Ok(WeightDelivery::Prepared(Box::new(PreparedWeight {
         source_names: binding
             .sources()
@@ -1785,6 +1891,55 @@ fn prepared_delivery(
         origin,
         resident_bytes,
     })))
+}
+
+fn cached_output_size(target: &TargetTensor) -> Result<u64> {
+    if target
+        .quantized_route()
+        .is_some_and(|capability| matches!(capability.route(), QuantizedRoute::HostRepack { .. }))
+    {
+        PackedOutputDescriptor::from_target(target)?.cached_len()
+    } else {
+        Ok(target.output_size())
+    }
+}
+
+/// Final packed bytes, preserving logical shape and numerical/layout identities.
+#[derive(Debug, Clone)]
+pub struct PreparedQuantizedWeight {
+    target: TargetTensor,
+    descriptor: PackedOutputDescriptor,
+    bytes: ByteView,
+    origin: PreparedOrigin,
+    resident_bytes: u64,
+}
+
+impl PreparedQuantizedWeight {
+    /// Returns the planned target contract.
+    #[must_use]
+    pub const fn target(&self) -> &TargetTensor {
+        &self.target
+    }
+    /// Returns the validated numerical and physical descriptor.
+    #[must_use]
+    pub const fn descriptor(&self) -> &PackedOutputDescriptor {
+        &self.descriptor
+    }
+    /// Returns packed bytes without their cache envelope.
+    #[must_use]
+    pub const fn bytes(&self) -> &ByteView {
+        &self.bytes
+    }
+    /// Returns whether preparation or a cache hit supplied the bytes.
+    #[must_use]
+    pub const fn origin(&self) -> PreparedOrigin {
+        self.origin
+    }
+    /// Returns retained host byte allocation size, including a retained cache envelope.
+    #[must_use]
+    pub const fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
 }
 
 fn validate_inventory_binding(checkpoint: &Checkpoint, binding: &Binding) -> Result<()> {

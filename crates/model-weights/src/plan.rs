@@ -2080,6 +2080,13 @@ fn validate_binding(
                     }
                 }
                 QuantizedRoute::FusedInTile | QuantizedRoute::Repack { .. } => {}
+                QuantizedRoute::HostRepack { .. } => {
+                    if capability.target_layout().is_none() || !target.transforms().is_empty() {
+                        return Err(Error::unsupported(
+                            "host repack requires an explicit packed layout and no dense transforms",
+                        ));
+                    }
+                }
             }
         }
     }

@@ -434,13 +434,31 @@ impl Default for ProviderRegistry {
 #[derive(Debug, Clone)]
 pub struct PreparationEngine {
     providers: ProviderRegistry,
+    packed: crate::packed_prepare::PackedProviderRegistry,
 }
 
 impl PreparationEngine {
     /// Creates an engine from a caller-configured registry.
     #[must_use]
-    pub const fn new(providers: ProviderRegistry) -> Self {
-        Self { providers }
+    pub fn new(providers: ProviderRegistry) -> Self {
+        Self {
+            providers,
+            packed: crate::packed_prepare::PackedProviderRegistry::default(),
+        }
+    }
+
+    /// Returns the exact packed host-preparation registry.
+    #[must_use]
+    pub const fn packed_providers(&self) -> &crate::packed_prepare::PackedProviderRegistry {
+        &self.packed
+    }
+
+    /// Returns the registry for consumer-owned host packer registration.
+    #[must_use]
+    pub const fn packed_providers_mut(
+        &mut self,
+    ) -> &mut crate::packed_prepare::PackedProviderRegistry {
+        &mut self.packed
     }
 
     /// Creates an engine containing the built-in contiguous provider.

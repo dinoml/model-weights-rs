@@ -928,6 +928,7 @@ impl OpenFile {
         cancellation.check()?;
         let mut raw = parse_header_json(&header, limits, cancellation)?;
         let quantization_metadata = raw.quantization_metadata.take();
+        let native_metadata = raw.native_metadata.take();
         cancellation.check()?;
         let tensors = validate_tensor_entries(
             self.id,
@@ -937,6 +938,17 @@ impl OpenFile {
             limits,
             cancellation,
         )?;
+        let tensors = if let Some(metadata) = native_metadata {
+            crate::native_quantization::normalize(
+                &metadata,
+                quantization_metadata.as_deref(),
+                tensors,
+                limits,
+                cancellation,
+            )?
+        } else {
+            tensors
+        };
         Ok(ParsedSource {
             format: CheckpointFormat::Safetensors,
             gguf_metadata: None,
@@ -1197,6 +1209,7 @@ struct RawTensor {
 struct RawHeader {
     tensors: BTreeMap<Box<str>, RawTensor>,
     quantization_metadata: Option<Box<str>>,
+    native_metadata: Option<Box<str>>,
 }
 
 fn parse_header_json(
@@ -1349,6 +1362,7 @@ impl<'de> Visitor<'de> for HeaderVisitor<'_, '_> {
         let mut tensors = BTreeMap::new();
         let mut seen_metadata = false;
         let mut quantization_metadata = None;
+        let mut native_metadata = None;
         loop {
             self.control.check()?;
             let Some(name) = map.next_key_seed(HeaderStringSeed {
@@ -1372,9 +1386,11 @@ impl<'de> Visitor<'de> for HeaderVisitor<'_, '_> {
                     ));
                 }
                 seen_metadata = true;
-                quantization_metadata = map.next_value_seed(MetadataSeed {
+                let metadata = map.next_value_seed(MetadataSeed {
                     control: self.control,
                 })?;
+                quantization_metadata = metadata.comfy;
+                native_metadata = metadata.native;
                 continue;
             }
             if name.len() > self.control.limits.max_name_bytes() {
@@ -1400,6 +1416,7 @@ impl<'de> Visitor<'de> for HeaderVisitor<'_, '_> {
         Ok(RawHeader {
             tensors,
             quantization_metadata,
+            native_metadata,
         })
     }
 }
@@ -1660,8 +1677,14 @@ struct MetadataSeed<'control, 'context> {
     control: &'control HeaderParseControl<'context>,
 }
 
+#[derive(Default)]
+struct HeaderMetadata {
+    comfy: Option<Box<str>>,
+    native: Option<Box<str>>,
+}
+
 impl<'de> DeserializeSeed<'de> for MetadataSeed<'_, '_> {
-    type Value = Option<Box<str>>;
+    type Value = HeaderMetadata;
 
     fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
     where
@@ -1679,7 +1702,7 @@ struct MetadataVisitor<'control, 'context> {
 }
 
 impl<'de> Visitor<'de> for MetadataVisitor<'_, '_> {
-    type Value = Option<Box<str>>;
+    type Value = HeaderMetadata;
 
     fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str("a safetensors string metadata map")
@@ -1691,7 +1714,7 @@ impl<'de> Visitor<'de> for MetadataVisitor<'_, '_> {
     {
         let mut seen = BTreeSet::new();
         let mut bytes = 0_usize;
-        let mut quantization_metadata = None;
+        let mut metadata = HeaderMetadata::default();
         loop {
             self.control.check()?;
             let remaining = self
@@ -1727,10 +1750,12 @@ impl<'de> Visitor<'de> for MetadataVisitor<'_, '_> {
             })?;
             bytes += value.len();
             if key.as_ref() == "_quantization_metadata" {
-                quantization_metadata = Some(value);
+                metadata.comfy = Some(value);
+            } else if key.as_ref() == crate::native_quantization::METADATA_KEY {
+                metadata.native = Some(value);
             }
         }
-        Ok(quantization_metadata)
+        Ok(metadata)
     }
 }
 
